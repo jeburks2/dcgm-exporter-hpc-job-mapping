@@ -1,3 +1,6 @@
+# Output binary
+dcgm-job-map
+
 # Prerequisites
 *.d
 
