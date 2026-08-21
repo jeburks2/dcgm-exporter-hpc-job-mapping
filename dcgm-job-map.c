@@ -1,3 +1,4 @@
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <nvml.h>
@@ -9,6 +10,70 @@
 
 #define DEFAULT_JOB_MAPPING_DIR "/var/run/dcgm_job_maps"
 #define MAX_ITEMS 1024
+
+/*
+ * NVML is loaded via dlopen instead of linked at build time: this program also runs on nodes
+ * with no NVIDIA GPU and no driver installed, where libnvidia-ml.so.1 does not exist. Linking
+ * it directly would keep the program from starting at all on those nodes.
+ */
+typedef nvmlReturn_t (*nvmlInit_v2_fn)(void);
+typedef nvmlReturn_t (*nvmlShutdown_fn)(void);
+typedef nvmlReturn_t (*nvmlDeviceGetCount_v2_fn)(unsigned int *deviceCount);
+typedef nvmlReturn_t (*nvmlDeviceGetHandleByIndex_v2_fn)(unsigned int index, nvmlDevice_t *device);
+typedef nvmlReturn_t (*nvmlDeviceGetMinorNumber_fn)(nvmlDevice_t device, unsigned int *minorNumber);
+typedef nvmlReturn_t (*nvmlDeviceGetMigMode_fn)(nvmlDevice_t device, unsigned int *currentMode, unsigned int *pendingMode);
+typedef nvmlReturn_t (*nvmlDeviceGetMaxMigDeviceCount_fn)(nvmlDevice_t device, unsigned int *maxMigDevices);
+typedef nvmlReturn_t (*nvmlDeviceGetMigDeviceHandleByIndex_fn)(nvmlDevice_t device, unsigned int index, nvmlDevice_t *migDevice);
+typedef nvmlReturn_t (*nvmlDeviceGetGpuInstanceId_fn)(nvmlDevice_t device, unsigned int *id);
+
+static void *nvml_lib = NULL;
+static nvmlInit_v2_fn nvmlInit_v2_p;
+static nvmlShutdown_fn nvmlShutdown_p;
+static nvmlDeviceGetCount_v2_fn nvmlDeviceGetCount_v2_p;
+static nvmlDeviceGetHandleByIndex_v2_fn nvmlDeviceGetHandleByIndex_v2_p;
+static nvmlDeviceGetMinorNumber_fn nvmlDeviceGetMinorNumber_p;
+static nvmlDeviceGetMigMode_fn nvmlDeviceGetMigMode_p;
+static nvmlDeviceGetMaxMigDeviceCount_fn nvmlDeviceGetMaxMigDeviceCount_p;
+static nvmlDeviceGetMigDeviceHandleByIndex_fn nvmlDeviceGetMigDeviceHandleByIndex_p;
+static nvmlDeviceGetGpuInstanceId_fn nvmlDeviceGetGpuInstanceId_p;
+
+/* Resolve one NVML symbol into *ptr, bailing out of load_nvml() if it's missing. */
+#define LOAD_SYM(ptr, name, type)                                         \
+    do                                                                    \
+    {                                                                     \
+        ptr = (type)dlsym(nvml_lib, name);                                \
+        if (!ptr)                                                         \
+        {                                                                 \
+            fprintf(stderr, "dcgm-job-map: libnvidia-ml.so.1 missing symbol %s\n", name); \
+            dlclose(nvml_lib);                                            \
+            nvml_lib = NULL;                                              \
+            return -1;                                                   \
+        }                                                                 \
+    } while (0)
+
+/*
+ * Load libnvidia-ml.so.1 and resolve the NVML entry points used below. Returns -1 silently if
+ * the library itself is missing -- the normal case on a GPU-less node -- but reports a missing
+ * symbol, since that points to a driver/header version mismatch instead.
+ */
+static int load_nvml(void)
+{
+    nvml_lib = dlopen("libnvidia-ml.so.1", RTLD_LAZY);
+    if (!nvml_lib)
+        return -1;
+
+    LOAD_SYM(nvmlInit_v2_p, "nvmlInit_v2", nvmlInit_v2_fn);
+    LOAD_SYM(nvmlShutdown_p, "nvmlShutdown", nvmlShutdown_fn);
+    LOAD_SYM(nvmlDeviceGetCount_v2_p, "nvmlDeviceGetCount_v2", nvmlDeviceGetCount_v2_fn);
+    LOAD_SYM(nvmlDeviceGetHandleByIndex_v2_p, "nvmlDeviceGetHandleByIndex_v2", nvmlDeviceGetHandleByIndex_v2_fn);
+    LOAD_SYM(nvmlDeviceGetMinorNumber_p, "nvmlDeviceGetMinorNumber", nvmlDeviceGetMinorNumber_fn);
+    LOAD_SYM(nvmlDeviceGetMigMode_p, "nvmlDeviceGetMigMode", nvmlDeviceGetMigMode_fn);
+    LOAD_SYM(nvmlDeviceGetMaxMigDeviceCount_p, "nvmlDeviceGetMaxMigDeviceCount", nvmlDeviceGetMaxMigDeviceCount_fn);
+    LOAD_SYM(nvmlDeviceGetMigDeviceHandleByIndex_p, "nvmlDeviceGetMigDeviceHandleByIndex", nvmlDeviceGetMigDeviceHandleByIndex_fn);
+    LOAD_SYM(nvmlDeviceGetGpuInstanceId_p, "nvmlDeviceGetGpuInstanceId", nvmlDeviceGetGpuInstanceId_fn);
+
+    return 0;
+}
 
 enum mode
 {
@@ -121,7 +186,7 @@ static int mig_enabled(nvmlDevice_t gpu)
     unsigned int current = 0;
     unsigned int pending = 0;
 
-    if (nvmlDeviceGetMigMode(gpu, &current, &pending) != NVML_SUCCESS)
+    if (nvmlDeviceGetMigMode_p(gpu, &current, &pending) != NVML_SUCCESS)
         return 0;
 
     return current == NVML_DEVICE_MIG_ENABLE;
@@ -151,7 +216,7 @@ static void collect_gpu_migs(nvmlDevice_t gpu, unsigned int gpu_id, char maps[][
 {
     unsigned int max_migs = 0;
 
-    if (nvmlDeviceGetMaxMigDeviceCount(gpu, &max_migs) != NVML_SUCCESS)
+    if (nvmlDeviceGetMaxMigDeviceCount_p(gpu, &max_migs) != NVML_SUCCESS)
         return;
 
     for (unsigned int mig_index = 0; mig_index < max_migs; mig_index++)
@@ -160,10 +225,10 @@ static void collect_gpu_migs(nvmlDevice_t gpu, unsigned int gpu_id, char maps[][
         unsigned int gi = 0;
         char map_id[32];
 
-        if (nvmlDeviceGetMigDeviceHandleByIndex(gpu, mig_index, &mig) != NVML_SUCCESS)
+        if (nvmlDeviceGetMigDeviceHandleByIndex_p(gpu, mig_index, &mig) != NVML_SUCCESS)
             continue;
 
-        if (nvmlDeviceGetGpuInstanceId(mig, &gi) != NVML_SUCCESS)
+        if (nvmlDeviceGetGpuInstanceId_p(mig, &gi) != NVML_SUCCESS)
             continue;
 
         snprintf(map_id, sizeof(map_id), "%u.%u", gpu_id, gi);
@@ -183,7 +248,7 @@ static int collect_maps(char maps[][32], unsigned int *count)
 
     *count = 0;
 
-    if (nvmlDeviceGetCount_v2(&gpu_count) != NVML_SUCCESS)
+    if (nvmlDeviceGetCount_v2_p(&gpu_count) != NVML_SUCCESS)
         return -1;
 
     for (unsigned int gpu_index = 0; gpu_index < gpu_count; gpu_index++)
@@ -191,10 +256,10 @@ static int collect_maps(char maps[][32], unsigned int *count)
         nvmlDevice_t gpu;
         unsigned int minor = 0;
 
-        if (nvmlDeviceGetHandleByIndex_v2(gpu_index, &gpu) != NVML_SUCCESS)
+        if (nvmlDeviceGetHandleByIndex_v2_p(gpu_index, &gpu) != NVML_SUCCESS)
             continue;
 
-        if (nvmlDeviceGetMinorNumber(gpu, &minor) != NVML_SUCCESS)
+        if (nvmlDeviceGetMinorNumber_p(gpu, &minor) != NVML_SUCCESS)
             continue;
 
         if (mig_enabled(gpu))
@@ -320,8 +385,15 @@ int main(int argc, char **argv)
 
     const char *dir = get_mapping_dir();
 
-    if (nvmlInit_v2() != NVML_SUCCESS)
+    /* No NVIDIA driver on this node is not an error for this program: skip mapping and exit clean. */
+    if (load_nvml() != 0)
         return nonzero ? 1 : 0;
+
+    if (nvmlInit_v2_p() != NVML_SUCCESS)
+    {
+        dlclose(nvml_lib);
+        return nonzero ? 1 : 0;
+    }
 
     if (run_mode == MODE_INIT)
     {
@@ -345,7 +417,8 @@ int main(int argc, char **argv)
         rc = run_job_mode(dir, "0");
     }
 
-    nvmlShutdown();
+    nvmlShutdown_p();
+    dlclose(nvml_lib);
 
     /* Without -nonzero, always exit 0 so this program never fails a Slurm prolog/epilog. */
     return nonzero ? rc : 0;

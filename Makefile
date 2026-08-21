@@ -6,7 +6,9 @@ SRC := dcgm-job-map.c
 
 CFLAGS ?= -O3 -Wall -Wextra
 CPPFLAGS += -I$(CUDA_HOME)/include
-LDLIBS += -lnvidia-ml
+# libnvidia-ml is dlopen'd at runtime, not linked, so this binary starts on nodes with no
+# NVIDIA driver installed. Only libdl itself is a real link-time dependency.
+LDLIBS += -ldl
 
 .PHONY: all clean install
 

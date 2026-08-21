@@ -6,11 +6,18 @@ The mapping files can be consumed by a DCGM Exporter job-mapping configuration s
 
 ## Requirements
 
+Build time:
+
 - Linux
 - GCC or another C compiler compatible with the Makefile
-- NVIDIA driver with NVML available
 - CUDA toolkit headers, for `nvml.h`
+
+Run time:
+
+- NVIDIA driver providing `libnvidia-ml.so.1`, on any node where GPU mapping should actually happen
 - Slurm for `-prolog` and `-epilog` integration, configured with `ConstrainDevices=yes`
+
+`libnvidia-ml.so.1` is loaded with `dlopen` at run time rather than linked at build time, so the same binary starts cleanly on GPU-less nodes (login nodes, CPU-only compute nodes) and simply does nothing: `-init` and `-prolog`/`-epilog` find no NVML library, skip GPU mapping, and exit `0`.
 
 ## Build
 
@@ -18,7 +25,7 @@ The mapping files can be consumed by a DCGM Exporter job-mapping configuration s
 make
 ```
 
-By default, the build expects CUDA at `/usr/local/cuda` and links against `libnvidia-ml`. If cuda is installed elsewhere, set `CUDA_HOME` to the correct path before running `make`. For example:
+By default, the build expects CUDA at `/usr/local/cuda`, for `nvml.h` and the NVML type/constant declarations only — the resulting binary does not link against `libnvidia-ml`. If cuda is installed elsewhere, set `CUDA_HOME` to the correct path before running `make`. For example:
 
 ```sh
 CUDA_HOME=/opt/cuda-13.2 make
