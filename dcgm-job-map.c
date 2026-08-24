@@ -432,16 +432,51 @@ static int all_digits(const char *s)
     return 1;
 }
 
-/* Report whether a device list names devices by UUID rather than by number. */
+/*
+ * Report whether a device list names devices by UUID rather than by number. Every UUID carries its
+ * "GPU-"/"MIG-" prefix, so a letter anywhere is the tell; a numeric list holds only digits, commas
+ * and the '-' of a range.
+ */
 static int is_uuid_list(const char *env)
 {
     for (const char *p = env; *p; p++)
     {
-        if (!isdigit((unsigned char)*p) && *p != ',')
+        if (isalpha((unsigned char)*p))
             return 1;
     }
 
     return 0;
+}
+
+/* Count the devices a numeric list names, expanding ranges. Used only to compare against what NVML sees. */
+static unsigned int count_device_entries(const char *env)
+{
+    char copy[1024];
+    char *saveptr = NULL;
+    char *tok;
+    unsigned int total = 0;
+
+    snprintf(copy, sizeof(copy), "%s", env);
+
+    for (tok = strtok_r(copy, ",", &saveptr); tok; tok = strtok_r(NULL, ",", &saveptr))
+    {
+        const char *dash = strchr(tok, '-');
+
+        if (dash && dash != tok && all_digits(dash + 1))
+        {
+            unsigned long lo = strtoul(tok, NULL, 10);
+            unsigned long hi = strtoul(dash + 1, NULL, 10);
+
+            if (hi >= lo)
+                total += (unsigned int)(hi - lo + 1);
+        }
+        else if (all_digits(tok))
+        {
+            total++;
+        }
+    }
+
+    return total;
 }
 
 /*
@@ -508,7 +543,10 @@ static void resolve_device_number(unsigned int index, char maps[][32], unsigned 
     {
         if (index >= node_device_count)
         {
-            fprintf(stderr, "dcgm-job-map: device %u is past the end of the node device table (%u devices)\n",
+            fprintf(stderr,
+                    "dcgm-job-map: device %u is past the end of the node device table (%u devices); "
+                    "Slurm numbers devices across the whole node, so this usually means NVML is only "
+                    "showing part of it -- run from the job Prolog/Epilog, not from inside the job\n",
                     index, node_device_count);
             return;
         }
@@ -622,11 +660,11 @@ static void resolve_device_entry(const char *entry, char maps[][32], unsigned in
 
 /*
  * Build the mapping ID list for this job from Slurm's allocated-device env var (see get_device_env()).
- * Used by -prolog and -epilog, which now run from the Slurm job Prolog/Epilog: once per allocation, via
- * slurmd as root, outside the job's cgroup. That means neither NVML enumeration nor a device-node open()
- * test is restricted to this job's devices the way it would be inside the job's cgroup, so unlike
+ * Used by -prolog and -epilog, which normally run from the Slurm job Prolog/Epilog: once per allocation,
+ * via slurmd as root, outside the job's cgroup. That means neither NVML enumeration nor a device-node
+ * open() test is restricted to this job's devices the way it would be inside the job's cgroup, so unlike
  * collect_maps() above, device identity has to come from what Slurm tells us it allocated, not from what
- * this process can see.
+ * this process can see -- except in the confined case handled below.
  */
 static int collect_job_maps(char maps[][32], unsigned int *count)
 {
@@ -646,6 +684,31 @@ static int collect_job_maps(char maps[][32], unsigned int *count)
 
     if (print_only)
         printf("allocated devices from %s=%s\n", name, env);
+
+    /*
+     * Slurm numbers devices across the whole node, but a process confined to the job's cgroup -- this
+     * program run from inside the job, or from a Prolog/Epilog under PrologFlags=RunInJob -- sees NVML
+     * enumerate only the job's own devices, so those node-wide numbers index the wrong table (and run
+     * off the end of it). When the allocation names exactly as many devices as NVML can see, though,
+     * the visible set *is* the allocation and the numbers are not needed: map everything visible. That
+     * is equally true unconfined for a job holding every device on the node, and it cannot misfire in
+     * the partial-allocation case, since a confined view never shows more devices than were allocated.
+     */
+    if (!is_uuid_list(env) && count_device_entries(env) == node_device_count)
+    {
+        if (print_only)
+            printf("all %u NVML-visible devices are allocated to this job: mapping them directly\n", node_device_count);
+
+        for (unsigned int i = 0; i < node_device_count; i++)
+        {
+            char map_id[32];
+
+            device_map_id(&node_devices[i], map_id, sizeof(map_id));
+            add_map(maps, count, map_id);
+        }
+
+        return 0;
+    }
 
     snprintf(copy, sizeof(copy), "%s", env);
 
