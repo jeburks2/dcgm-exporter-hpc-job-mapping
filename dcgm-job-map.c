@@ -1,3 +1,4 @@
+#include <ctype.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -25,6 +26,8 @@ typedef nvmlReturn_t (*nvmlDeviceGetMigMode_fn)(nvmlDevice_t device, unsigned in
 typedef nvmlReturn_t (*nvmlDeviceGetMaxMigDeviceCount_fn)(nvmlDevice_t device, unsigned int *maxMigDevices);
 typedef nvmlReturn_t (*nvmlDeviceGetMigDeviceHandleByIndex_fn)(nvmlDevice_t device, unsigned int index, nvmlDevice_t *migDevice);
 typedef nvmlReturn_t (*nvmlDeviceGetGpuInstanceId_fn)(nvmlDevice_t device, unsigned int *id);
+typedef nvmlReturn_t (*nvmlDeviceGetHandleByUUID_fn)(const char *uuid, nvmlDevice_t *device);
+typedef nvmlReturn_t (*nvmlDeviceGetDeviceHandleFromMigDeviceHandle_fn)(nvmlDevice_t migDevice, nvmlDevice_t *device);
 
 static void *nvml_lib = NULL;
 static nvmlInit_v2_fn nvmlInit_v2_p;
@@ -36,6 +39,8 @@ static nvmlDeviceGetMigMode_fn nvmlDeviceGetMigMode_p;
 static nvmlDeviceGetMaxMigDeviceCount_fn nvmlDeviceGetMaxMigDeviceCount_p;
 static nvmlDeviceGetMigDeviceHandleByIndex_fn nvmlDeviceGetMigDeviceHandleByIndex_p;
 static nvmlDeviceGetGpuInstanceId_fn nvmlDeviceGetGpuInstanceId_p;
+static nvmlDeviceGetHandleByUUID_fn nvmlDeviceGetHandleByUUID_p;
+static nvmlDeviceGetDeviceHandleFromMigDeviceHandle_fn nvmlDeviceGetDeviceHandleFromMigDeviceHandle_p;
 
 /* Resolve one NVML symbol into *ptr, bailing out of load_nvml() if it's missing. */
 #define LOAD_SYM(ptr, name, type)                                         \
@@ -71,6 +76,8 @@ static int load_nvml(void)
     LOAD_SYM(nvmlDeviceGetMaxMigDeviceCount_p, "nvmlDeviceGetMaxMigDeviceCount", nvmlDeviceGetMaxMigDeviceCount_fn);
     LOAD_SYM(nvmlDeviceGetMigDeviceHandleByIndex_p, "nvmlDeviceGetMigDeviceHandleByIndex", nvmlDeviceGetMigDeviceHandleByIndex_fn);
     LOAD_SYM(nvmlDeviceGetGpuInstanceId_p, "nvmlDeviceGetGpuInstanceId", nvmlDeviceGetGpuInstanceId_fn);
+    LOAD_SYM(nvmlDeviceGetHandleByUUID_p, "nvmlDeviceGetHandleByUUID", nvmlDeviceGetHandleByUUID_fn);
+    LOAD_SYM(nvmlDeviceGetDeviceHandleFromMigDeviceHandle_p, "nvmlDeviceGetDeviceHandleFromMigDeviceHandle", nvmlDeviceGetDeviceHandleFromMigDeviceHandle_fn);
 
     return 0;
 }
@@ -108,13 +115,17 @@ static void usage(const char *prog)
         "  -help     Show this help message\n"
         "\n"
         "Device selection:\n"
-        "  Devices come from NVML as constrained by the Slurm cgroup, not from\n"
-        "  CUDA_VISIBLE_DEVICES or SLURM_JOB_GPUS. Run -prolog and -epilog inside\n"
-        "  the job cgroup (task prolog/epilog) so only allocated devices are seen.\n"
+        "  -prolog and -epilog run from the Slurm job Prolog/Epilog (slurmd, once\n"
+        "  per allocation, outside the job's cgroup) and read the devices Slurm\n"
+        "  allocated to the job from CUDA_VISIBLE_DEVICES, falling back to\n"
+        "  GPU_DEVICE_ORDINAL if that is unset. Each entry may be an NVML\n"
+        "  enumeration ordinal or a GPU/MIG instance UUID.\n"
         "\n"
         "Environment:\n"
         "  DCGM_HPC_JOB_MAPPING_DIR  Directory for job mapping files\n"
         "  SLURM_JOB_ID              Job ID written by -prolog\n"
+        "  CUDA_VISIBLE_DEVICES      Devices allocated to the job (-prolog/-epilog)\n"
+        "  GPU_DEVICE_ORDINAL        Fallback device list if CUDA_VISIBLE_DEVICES unset\n"
         "\n"
         "Default mapping dir: %s\n",
         prog,
@@ -132,7 +143,12 @@ static const char *get_mapping_dir(void)
     return dir;
 }
 
-/* Write or print one mapping file update. chmod_file is only set by -init, so files stay job-user writable. */
+/*
+ * Write or print one mapping file update. chmod_file is only set by -init, to fix up permissions on a
+ * freshly created file: dcgm-exporter just needs to read it, since -prolog and -epilog now run as root
+ * (via slurmd, from the job Prolog/Epilog) rather than as the job user, so the files no longer need to
+ * be user-writable.
+ */
 static int write_map(const char *dir, const char *map_id, const char *value, int chmod_file)
 {
     char path[512];
@@ -153,7 +169,7 @@ static int write_map(const char *dir, const char *map_id, const char *value, int
     fclose(f);
 
     if (chmod_file)
-        chmod(path, 0666);
+        chmod(path, 0644);
 
     return 0;
 }
@@ -192,7 +208,11 @@ static int mig_enabled(nvmlDevice_t gpu)
     return current == NVML_DEVICE_MIG_ENABLE;
 }
 
-/* Report whether this process may open the GPU's device node — the cgroup allocation test for full GPUs. */
+/*
+ * Report whether this process may open the GPU's device node. Used only by -init (which runs
+ * unrestricted, outside any job) as a sanity check that an NVML-enumerated full GPU has a live
+ * /dev entry; it is not a job-allocation test.
+ */
 static int device_node_accessible(unsigned int minor)
 {
     char path[64];
@@ -237,10 +257,10 @@ static void collect_gpu_migs(nvmlDevice_t gpu, unsigned int gpu_id, char maps[][
 }
 
 /*
- * Build the list of mapping IDs for this node: "<gpu>.<gi>" per MIG instance, or "<gpu>" for a full GPU
- * that this process can open. IDs use the GPU's minor number, not its NVML enumeration position — under
- * a cgroup, NVML renumbers visible devices from 0, so the enumeration index isn't stable across an
- * unrestricted -init run and a restricted -prolog/-epilog run, but the minor number is.
+ * Build the list of mapping IDs for every device on the node: "<gpu>.<gi>" per MIG instance, or "<gpu>"
+ * for a full GPU that this process can open. IDs use the GPU's minor number, not its NVML enumeration
+ * position, so they stay stable regardless of NVML enumeration order. Used only by -init, which must see
+ * every device on the node; -prolog and -epilog use collect_job_maps() instead, below.
  */
 static int collect_maps(char maps[][32], unsigned int *count)
 {
@@ -278,6 +298,125 @@ static int collect_maps(char maps[][32], unsigned int *count)
     return 0;
 }
 
+/*
+ * Return the env var listing devices Slurm allocated to this job, or NULL if neither is set (e.g. a
+ * job that did not request a GPU). CUDA_VISIBLE_DEVICES is preferred since it is what CUDA-based
+ * frameworks honor; GPU_DEVICE_ORDINAL is a fallback for sites where only it is configured.
+ */
+static const char *get_device_env(void)
+{
+    const char *cvd = getenv("CUDA_VISIBLE_DEVICES");
+
+    if (cvd && *cvd)
+        return cvd;
+
+    const char *ordinal = getenv("GPU_DEVICE_ORDINAL");
+
+    if (ordinal && *ordinal)
+        return ordinal;
+
+    return NULL;
+}
+
+/*
+ * Resolve one CUDA_VISIBLE_DEVICES/GPU_DEVICE_ORDINAL entry into the mapping ID(s) it names, appending
+ * them to maps/count. An entry is either a plain NVML enumeration ordinal or a UUID; nvmlDeviceGetHandleByUUID
+ * accepts both a full GPU's UUID and a MIG instance's UUID, resolving straight to the matching handle.
+ * Once resolved, nvmlDeviceGetGpuInstanceId succeeding is what tells a MIG instance handle apart from a
+ * full GPU handle, since only a MIG device has an instance ID at all.
+ */
+static void resolve_device_entry(const char *entry, char maps[][32], unsigned int *count)
+{
+    nvmlDevice_t dev;
+    unsigned int minor = 0;
+    unsigned int gi = 0;
+    int is_ordinal = 1;
+
+    if (!*entry)
+        return;
+
+    for (const char *p = entry; *p; p++)
+    {
+        if (!isdigit((unsigned char)*p))
+        {
+            is_ordinal = 0;
+            break;
+        }
+    }
+
+    if (is_ordinal)
+    {
+        if (nvmlDeviceGetHandleByIndex_v2_p((unsigned int)strtoul(entry, NULL, 10), &dev) != NVML_SUCCESS)
+            return;
+    }
+    else if (nvmlDeviceGetHandleByUUID_p(entry, &dev) != NVML_SUCCESS)
+    {
+        return;
+    }
+
+    if (nvmlDeviceGetGpuInstanceId_p(dev, &gi) == NVML_SUCCESS)
+    {
+        /* dev is a MIG instance handle: find its parent GPU's minor number to name it "<minor>.<gi>". */
+        nvmlDevice_t parent;
+        char map_id[32];
+
+        if (nvmlDeviceGetDeviceHandleFromMigDeviceHandle_p(dev, &parent) != NVML_SUCCESS)
+            return;
+
+        if (nvmlDeviceGetMinorNumber_p(parent, &minor) != NVML_SUCCESS)
+            return;
+
+        snprintf(map_id, sizeof(map_id), "%u.%u", minor, gi);
+        add_map(maps, count, map_id);
+        return;
+    }
+
+    if (nvmlDeviceGetMinorNumber_p(dev, &minor) != NVML_SUCCESS)
+        return;
+
+    if (mig_enabled(dev))
+    {
+        /* Named by ordinal or full-GPU UUID rather than an instance UUID: the allocation doesn't tell us
+         * which instance(s) of this MIG GPU the job owns, so map every instance on it. */
+        collect_gpu_migs(dev, minor, maps, count);
+    }
+    else
+    {
+        char map_id[32];
+
+        snprintf(map_id, sizeof(map_id), "%u", minor);
+        add_map(maps, count, map_id);
+    }
+}
+
+/*
+ * Build the mapping ID list for this job from Slurm's allocated-device env var (see get_device_env()).
+ * Used by -prolog and -epilog, which now run from the Slurm job Prolog/Epilog: once per allocation, via
+ * slurmd as root, outside the job's cgroup. That means neither NVML enumeration nor a device-node open()
+ * test is restricted to this job's devices the way it would be inside the job's cgroup, so unlike
+ * collect_maps() above, device identity has to come from what Slurm tells us it allocated, not from what
+ * this process can see.
+ */
+static int collect_job_maps(char maps[][32], unsigned int *count)
+{
+    const char *env = get_device_env();
+    char copy[1024];
+    char *saveptr = NULL;
+    char *tok;
+
+    *count = 0;
+
+    if (!env)
+        return 0; /* no GPUs allocated to this job: nothing to map */
+
+    snprintf(copy, sizeof(copy), "%s", env);
+
+    for (tok = strtok_r(copy, ",", &saveptr); tok; tok = strtok_r(NULL, ",", &saveptr))
+        resolve_device_entry(tok, maps, count);
+
+    return 0;
+}
+
 /* Write one value to each collected mapping file, skipping duplicates. */
 static int write_maps(const char *dir, char maps[][32], unsigned int count, const char *value, int chmod_file)
 {
@@ -299,7 +438,7 @@ static int write_maps(const char *dir, char maps[][32], unsigned int count, cons
     return rc;
 }
 
-/* Create root-owned, user-writable files for every full GPU and MIG GPU instance on the node. */
+/* Create root-owned, world-readable files for every full GPU and MIG GPU instance on the node. */
 static int run_init(const char *dir)
 {
     char maps[MAX_ITEMS][32];
@@ -320,7 +459,7 @@ static int run_job_mode(const char *dir, const char *value)
     char maps[MAX_ITEMS][32];
     unsigned int count = 0;
 
-    if (collect_maps(maps, &count) != 0)
+    if (collect_job_maps(maps, &count) != 0)
         return -1;
 
     return write_maps(dir, maps, count, value, 0);
