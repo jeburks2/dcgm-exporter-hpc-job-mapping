@@ -87,18 +87,34 @@ enum mode
     MODE_NONE,
     MODE_INIT,
     MODE_PROLOG,
-    MODE_EPILOG
+    MODE_EPILOG,
+    MODE_LIST
+};
+
+/*
+ * How to read a plain number in the allocated-device list. Slurm numbers the GPU gres on a node
+ * across every device it can allocate, so on a MIG node each *GPU instance* consumes one number
+ * and a full GPU's NVML enumeration ordinal is not that number. ORDINAL_GRES resolves a number
+ * through the node device table below (Slurm's numbering); ORDINAL_GPU is the old behavior, a
+ * direct NVML enumeration index, kept as an escape hatch for sites whose gres.conf lists whole
+ * GPUs on MIG-enabled nodes.
+ */
+enum ordinal_mode
+{
+    ORDINAL_GRES,
+    ORDINAL_GPU
 };
 
 static int print_only = 0;
 static int nonzero = 0;
 static enum mode run_mode = MODE_NONE;
+static enum ordinal_mode ordinal_mode = ORDINAL_GRES;
 
 /* Print command usage and behavior. */
 static void usage(const char *prog)
 {
     printf(
-        "Usage: %s -init|-prolog|-epilog [-print] [-nonzero] [-help]\n"
+        "Usage: %s -init|-prolog|-epilog|-list [-print] [-nonzero] [-help]\n"
         "\n"
         "Manage dcgm_exporter Slurm job mapping files.\n"
         "\n"
@@ -108,6 +124,8 @@ static void usage(const char *prog)
         "            on the node, not one job's allocated slice of it.\n"
         "  -prolog   Write SLURM_JOB_ID to the allocated mapping files\n"
         "  -epilog   Truncate allocated mapping files and write 0\n"
+        "  -list     Print the node device table: the Slurm gres index of every\n"
+        "            allocatable device and the mapping file it resolves to\n"
         "\n"
         "Options:\n"
         "  -print    Print what would be written instead of writing files\n"
@@ -117,15 +135,21 @@ static void usage(const char *prog)
         "Device selection:\n"
         "  -prolog and -epilog run from the Slurm job Prolog/Epilog (slurmd, once\n"
         "  per allocation, outside the job's cgroup) and read the devices Slurm\n"
-        "  allocated to the job from CUDA_VISIBLE_DEVICES, falling back to\n"
-        "  GPU_DEVICE_ORDINAL if that is unset. Each entry may be an NVML\n"
-        "  enumeration ordinal or a GPU/MIG instance UUID.\n"
+        "  allocated to the job from SLURM_JOB_GPUS, CUDA_VISIBLE_DEVICES or\n"
+        "  GPU_DEVICE_ORDINAL. Each entry is either a GPU/MIG instance UUID or a\n"
+        "  Slurm gres index -- a position in the node device table (-list), where a\n"
+        "  MIG-mode GPU contributes one entry per GPU instance rather than one entry\n"
+        "  for the whole GPU.\n"
         "\n"
         "Environment:\n"
         "  DCGM_HPC_JOB_MAPPING_DIR  Directory for job mapping files\n"
         "  SLURM_JOB_ID              Job ID written by -prolog\n"
-        "  CUDA_VISIBLE_DEVICES      Devices allocated to the job (-prolog/-epilog)\n"
-        "  GPU_DEVICE_ORDINAL        Fallback device list if CUDA_VISIBLE_DEVICES unset\n"
+        "  SLURM_JOB_GPUS            Devices allocated to the job (-prolog/-epilog)\n"
+        "  CUDA_VISIBLE_DEVICES      Preferred over SLURM_JOB_GPUS when it holds UUIDs\n"
+        "  GPU_DEVICE_ORDINAL        Fallback device list if neither above is set\n"
+        "  DCGM_HPC_JOB_MAPPING_ORDINALS\n"
+        "                            gres (default) or gpu: how to read a plain\n"
+        "                            number in the device list\n"
         "\n"
         "Default mapping dir: %s\n",
         prog,
@@ -229,10 +253,45 @@ static int device_node_accessible(unsigned int minor)
 }
 
 /*
- * Add every MIG GPU instance NVML exposes for one GPU as "<gpu>.<gi>".
- * Instances outside the job's allocation fail the handle/GI lookup below and are skipped that way.
+ * One allocatable device on the node: a full GPU, or a single MIG GPU instance of one. The table
+ * below holds these in NVML enumeration order -- GPUs by NVML index, and within a MIG-mode GPU its
+ * instances by MIG index -- which is the order Slurm's gres/gpu NVML autodetect builds the node's
+ * GPU gres list in, and therefore the order its device numbering follows.
  */
-static void collect_gpu_migs(nvmlDevice_t gpu, unsigned int gpu_id, char maps[][32], unsigned int *count)
+struct node_device
+{
+    unsigned int minor; /* parent GPU's minor number, i.e. /dev/nvidia<minor> */
+    unsigned int gi;    /* GPU instance ID, meaningful only when is_mig */
+    int is_mig;
+};
+
+static struct node_device node_devices[MAX_ITEMS];
+static unsigned int node_device_count = 0;
+static int node_table_built = 0;
+
+/* Name the mapping file for one node device: "<minor>.<gi>" for a MIG instance, "<minor>" otherwise. */
+static void device_map_id(const struct node_device *dev, char *buf, size_t len)
+{
+    if (dev->is_mig)
+        snprintf(buf, len, "%u.%u", dev->minor, dev->gi);
+    else
+        snprintf(buf, len, "%u", dev->minor);
+}
+
+/* Append one device to the node table, silently dropping it if the fixed-size array is full. */
+static void add_node_device(unsigned int minor, int is_mig, unsigned int gi)
+{
+    if (node_device_count >= MAX_ITEMS)
+        return;
+
+    node_devices[node_device_count].minor = minor;
+    node_devices[node_device_count].is_mig = is_mig;
+    node_devices[node_device_count].gi = gi;
+    node_device_count++;
+}
+
+/* Add every MIG GPU instance NVML exposes for one GPU to the node table, in MIG index order. */
+static void add_gpu_migs(nvmlDevice_t gpu, unsigned int minor)
 {
     unsigned int max_migs = 0;
 
@@ -243,30 +302,29 @@ static void collect_gpu_migs(nvmlDevice_t gpu, unsigned int gpu_id, char maps[][
     {
         nvmlDevice_t mig;
         unsigned int gi = 0;
-        char map_id[32];
 
+        /* max_migs is the profile-independent upper bound, so unpopulated slots are expected here. */
         if (nvmlDeviceGetMigDeviceHandleByIndex_p(gpu, mig_index, &mig) != NVML_SUCCESS)
             continue;
 
         if (nvmlDeviceGetGpuInstanceId_p(mig, &gi) != NVML_SUCCESS)
             continue;
 
-        snprintf(map_id, sizeof(map_id), "%u.%u", gpu_id, gi);
-        add_map(maps, count, map_id);
+        add_node_device(minor, 1, gi);
     }
 }
 
 /*
- * Build the list of mapping IDs for every device on the node: "<gpu>.<gi>" per MIG instance, or "<gpu>"
- * for a full GPU that this process can open. IDs use the GPU's minor number, not its NVML enumeration
- * position, so they stay stable regardless of NVML enumeration order. Used only by -init, which must see
- * every device on the node; -prolog and -epilog use collect_job_maps() instead, below.
+ * Enumerate every allocatable device on the node once, into node_devices[]. Devices are identified by
+ * the parent GPU's minor number (its /dev/nvidia<minor> node), not its NVML enumeration position, so
+ * every mode agrees on a file name for the same physical device regardless of enumeration order.
  */
-static int collect_maps(char maps[][32], unsigned int *count)
+static int build_node_device_table(void)
 {
     unsigned int gpu_count = 0;
 
-    *count = 0;
+    if (node_table_built)
+        return 0;
 
     if (nvmlDeviceGetCount_v2_p(&gpu_count) != NVML_SUCCESS)
         return -1;
@@ -283,76 +341,249 @@ static int collect_maps(char maps[][32], unsigned int *count)
             continue;
 
         if (mig_enabled(gpu))
-        {
-            collect_gpu_migs(gpu, minor, maps, count);
-        }
-        else if (device_node_accessible(minor))
-        {
-            char map_id[32];
+            add_gpu_migs(gpu, minor);
+        else
+            add_node_device(minor, 0, 0);
+    }
 
-            snprintf(map_id, sizeof(map_id), "%u", minor);
-            add_map(maps, count, map_id);
-        }
+    node_table_built = 1;
+    return 0;
+}
+
+/* Add every MIG GPU instance of one GPU to a map list, for an entry that names the GPU but not an instance. */
+static void collect_gpu_migs(unsigned int minor, char maps[][32], unsigned int *count)
+{
+    for (unsigned int i = 0; i < node_device_count; i++)
+    {
+        char map_id[32];
+
+        if (!node_devices[i].is_mig || node_devices[i].minor != minor)
+            continue;
+
+        device_map_id(&node_devices[i], map_id, sizeof(map_id));
+        add_map(maps, count, map_id);
+    }
+}
+
+/*
+ * Build the list of mapping IDs for every device on the node: "<gpu>.<gi>" per MIG instance, or "<gpu>"
+ * for a full GPU that this process can open. Used only by -init, which must see every device on the node;
+ * -prolog and -epilog use collect_job_maps() instead, below.
+ */
+static int collect_maps(char maps[][32], unsigned int *count)
+{
+    *count = 0;
+
+    if (build_node_device_table() != 0)
+        return -1;
+
+    for (unsigned int i = 0; i < node_device_count; i++)
+    {
+        char map_id[32];
+
+        if (!node_devices[i].is_mig && !device_node_accessible(node_devices[i].minor))
+            continue;
+
+        device_map_id(&node_devices[i], map_id, sizeof(map_id));
+        add_map(maps, count, map_id);
+    }
+
+    return 0;
+}
+
+/* Print the node device table with the Slurm gres index of each device (-list). */
+static int run_list(const char *dir)
+{
+    if (build_node_device_table() != 0)
+        return -1;
+
+    printf("Slurm gres index -> mapping file (%s)\n", dir);
+
+    for (unsigned int i = 0; i < node_device_count; i++)
+    {
+        char map_id[32];
+
+        device_map_id(&node_devices[i], map_id, sizeof(map_id));
+
+        if (node_devices[i].is_mig)
+            printf("  %u\t%s\t(MIG instance %u on /dev/nvidia%u)\n", i, map_id, node_devices[i].gi, node_devices[i].minor);
+        else
+            printf("  %u\t%s\t(full GPU /dev/nvidia%u)\n", i, map_id, node_devices[i].minor);
+    }
+
+    if (node_device_count == 0)
+        printf("  (no devices found)\n");
+
+    return 0;
+}
+
+/* Report whether every character of s is a digit, i.e. s is a plain device number. */
+static int all_digits(const char *s)
+{
+    if (!*s)
+        return 0;
+
+    for (const char *p = s; *p; p++)
+    {
+        if (!isdigit((unsigned char)*p))
+            return 0;
+    }
+
+    return 1;
+}
+
+/* Report whether a device list names devices by UUID rather than by number. */
+static int is_uuid_list(const char *env)
+{
+    for (const char *p = env; *p; p++)
+    {
+        if (!isdigit((unsigned char)*p) && *p != ',')
+            return 1;
     }
 
     return 0;
 }
 
 /*
- * Return the env var listing devices Slurm allocated to this job, or NULL if neither is set (e.g. a
- * job that did not request a GPU). CUDA_VISIBLE_DEVICES is preferred since it is what CUDA-based
- * frameworks honor; GPU_DEVICE_ORDINAL is a fallback for sites where only it is configured.
+ * Return the env var listing devices Slurm allocated to this job, or NULL if none is set (e.g. a job
+ * that did not request a GPU). *name, when non-NULL, receives the variable the list came from.
+ *
+ * In the job Prolog/Epilog environment Slurm exports the allocation as device numbers, not UUIDs --
+ * even for a MIG allocation, where the job itself would later see a MIG-<uuid> in CUDA_VISIBLE_DEVICES.
+ * SLURM_JOB_GPUS is the authoritative form of that numbering, so it is preferred; CUDA_VISIBLE_DEVICES
+ * wins only when it holds UUIDs, which identify the exact device and need no numbering assumption at
+ * all. GPU_DEVICE_ORDINAL is a last fallback for sites where only it is configured.
  */
-static const char *get_device_env(void)
+static const char *get_device_env(const char **name)
 {
     const char *cvd = getenv("CUDA_VISIBLE_DEVICES");
-
-    if (cvd && *cvd)
-        return cvd;
-
+    const char *job_gpus = getenv("SLURM_JOB_GPUS");
     const char *ordinal = getenv("GPU_DEVICE_ORDINAL");
 
+    if (cvd && *cvd && is_uuid_list(cvd))
+    {
+        if (name)
+            *name = "CUDA_VISIBLE_DEVICES";
+        return cvd;
+    }
+
+    if (job_gpus && *job_gpus)
+    {
+        if (name)
+            *name = "SLURM_JOB_GPUS";
+        return job_gpus;
+    }
+
+    if (cvd && *cvd)
+    {
+        if (name)
+            *name = "CUDA_VISIBLE_DEVICES";
+        return cvd;
+    }
+
     if (ordinal && *ordinal)
+    {
+        if (name)
+            *name = "GPU_DEVICE_ORDINAL";
         return ordinal;
+    }
 
     return NULL;
 }
 
 /*
- * Resolve one CUDA_VISIBLE_DEVICES/GPU_DEVICE_ORDINAL entry into the mapping ID(s) it names, appending
- * them to maps/count. An entry is either a plain NVML enumeration ordinal or a UUID; nvmlDeviceGetHandleByUUID
- * accepts both a full GPU's UUID and a MIG instance's UUID, resolving straight to the matching handle.
- * Once resolved, nvmlDeviceGetGpuInstanceId succeeding is what tells a MIG instance handle apart from a
- * full GPU handle, since only a MIG device has an instance ID at all.
+ * Resolve one device number into the mapping ID it names. Under the default ORDINAL_GRES this is a
+ * position in the node device table, which is how Slurm numbers the GPU gres it can allocate: on a
+ * MIG-mode GPU each GPU instance is its own allocatable device and gets its own number, so number 0
+ * on a node whose first GPU is partitioned is that GPU's first instance, not the whole GPU. Under
+ * ORDINAL_GPU it is an NVML enumeration index, naming a whole GPU (and with it every instance on it).
+ */
+static void resolve_device_number(unsigned int index, char maps[][32], unsigned int *count)
+{
+    nvmlDevice_t dev;
+    unsigned int minor = 0;
+    char map_id[32];
+
+    if (ordinal_mode == ORDINAL_GRES)
+    {
+        if (index >= node_device_count)
+        {
+            fprintf(stderr, "dcgm-job-map: device %u is past the end of the node device table (%u devices)\n",
+                    index, node_device_count);
+            return;
+        }
+
+        device_map_id(&node_devices[index], map_id, sizeof(map_id));
+        add_map(maps, count, map_id);
+        return;
+    }
+
+    if (nvmlDeviceGetHandleByIndex_v2_p(index, &dev) != NVML_SUCCESS)
+        return;
+
+    if (nvmlDeviceGetMinorNumber_p(dev, &minor) != NVML_SUCCESS)
+        return;
+
+    if (mig_enabled(dev))
+    {
+        collect_gpu_migs(minor, maps, count);
+        return;
+    }
+
+    snprintf(map_id, sizeof(map_id), "%u", minor);
+    add_map(maps, count, map_id);
+}
+
+/*
+ * Resolve one entry of the allocated-device list into the mapping ID(s) it names, appending them to
+ * maps/count. An entry is either a device number (see resolve_device_number()), an inclusive range of
+ * them ("2-5"), or a UUID. nvmlDeviceGetHandleByUUID accepts both a full GPU's UUID and a MIG instance's
+ * UUID, resolving straight to the matching handle. Once resolved, nvmlDeviceGetGpuInstanceId succeeding
+ * is what tells a MIG instance handle apart from a full GPU handle, since only a MIG device has an
+ * instance ID at all.
  */
 static void resolve_device_entry(const char *entry, char maps[][32], unsigned int *count)
 {
     nvmlDevice_t dev;
     unsigned int minor = 0;
     unsigned int gi = 0;
-    int is_ordinal = 1;
+    const char *dash;
 
     if (!*entry)
         return;
 
-    for (const char *p = entry; *p; p++)
+    if (all_digits(entry))
     {
-        if (!isdigit((unsigned char)*p))
+        resolve_device_number((unsigned int)strtoul(entry, NULL, 10), maps, count);
+        return;
+    }
+
+    /* A range like "0-3"; a UUID also contains '-', so both sides must be plain numbers. */
+    dash = strchr(entry, '-');
+    if (dash && dash != entry && all_digits(dash + 1))
+    {
+        char first[16];
+        size_t len = (size_t)(dash - entry);
+
+        if (len < sizeof(first))
         {
-            is_ordinal = 0;
-            break;
+            snprintf(first, len + 1, "%s", entry);
+
+            if (all_digits(first))
+            {
+                unsigned long lo = strtoul(first, NULL, 10);
+                unsigned long hi = strtoul(dash + 1, NULL, 10);
+
+                for (unsigned long i = lo; i <= hi && i < MAX_ITEMS; i++)
+                    resolve_device_number((unsigned int)i, maps, count);
+
+                return;
+            }
         }
     }
 
-    if (is_ordinal)
-    {
-        if (nvmlDeviceGetHandleByIndex_v2_p((unsigned int)strtoul(entry, NULL, 10), &dev) != NVML_SUCCESS)
-            return;
-    }
-    else if (nvmlDeviceGetHandleByUUID_p(entry, &dev) != NVML_SUCCESS)
-    {
+    if (nvmlDeviceGetHandleByUUID_p(entry, &dev) != NVML_SUCCESS)
         return;
-    }
 
     if (nvmlDeviceGetGpuInstanceId_p(dev, &gi) == NVML_SUCCESS)
     {
@@ -376,9 +607,9 @@ static void resolve_device_entry(const char *entry, char maps[][32], unsigned in
 
     if (mig_enabled(dev))
     {
-        /* Named by ordinal or full-GPU UUID rather than an instance UUID: the allocation doesn't tell us
-         * which instance(s) of this MIG GPU the job owns, so map every instance on it. */
-        collect_gpu_migs(dev, minor, maps, count);
+        /* Named by a full-GPU UUID rather than an instance UUID: the allocation doesn't tell us which
+         * instance(s) of this MIG GPU the job owns, so map every instance on it. */
+        collect_gpu_migs(minor, maps, count);
     }
     else
     {
@@ -399,7 +630,8 @@ static void resolve_device_entry(const char *entry, char maps[][32], unsigned in
  */
 static int collect_job_maps(char maps[][32], unsigned int *count)
 {
-    const char *env = get_device_env();
+    const char *name = NULL;
+    const char *env = get_device_env(&name);
     char copy[1024];
     char *saveptr = NULL;
     char *tok;
@@ -408,6 +640,12 @@ static int collect_job_maps(char maps[][32], unsigned int *count)
 
     if (!env)
         return 0; /* no GPUs allocated to this job: nothing to map */
+
+    if (build_node_device_table() != 0)
+        return -1;
+
+    if (print_only)
+        printf("allocated devices from %s=%s\n", name, env);
 
     snprintf(copy, sizeof(copy), "%s", env);
 
@@ -483,6 +721,10 @@ int main(int argc, char **argv)
         {
             run_mode = MODE_EPILOG;
         }
+        else if (strcmp(argv[i], "-list") == 0)
+        {
+            run_mode = MODE_LIST;
+        }
         else if (strcmp(argv[i], "-print") == 0)
         {
             print_only = 1;
@@ -523,6 +765,10 @@ int main(int argc, char **argv)
     }
 
     const char *dir = get_mapping_dir();
+    const char *ordinals = getenv("DCGM_HPC_JOB_MAPPING_ORDINALS");
+
+    if (ordinals && strcmp(ordinals, "gpu") == 0)
+        ordinal_mode = ORDINAL_GPU;
 
     /* No NVIDIA driver on this node is not an error for this program: skip mapping and exit clean. */
     if (load_nvml() != 0)
@@ -554,6 +800,10 @@ int main(int argc, char **argv)
     else if (run_mode == MODE_EPILOG)
     {
         rc = run_job_mode(dir, "0");
+    }
+    else if (run_mode == MODE_LIST)
+    {
+        rc = run_list(dir);
     }
 
     nvmlShutdown_p();
