@@ -1,23 +1,16 @@
-# DCGM Exporter HPC Job Mapping
+# dcgm-job-map
 
-`dcgm-job-map` is a small C utility for integrating [DCGM Exporter](https://github.com/NVIDIA/dcgm-exporter) with Slurm. It maintains per-GPU or per-MIG GPU instance mapping files containing the Slurm job ID currently using each device.
+A small C utility that records which Slurm job is using each GPU, for use with [DCGM Exporter](https://github.com/NVIDIA/dcgm-exporter)'s HPC job mapping. It maintains one file per GPU (or per MIG GPU instance) containing the job ID currently running on it, so exported GPU metrics can be attributed to jobs.
 
-The mapping files can be consumed by a DCGM Exporter job-mapping configuration so exported GPU metrics can be associated with HPC jobs.
+Three modes cover the lifecycle: `-init` creates the files at boot, `-prolog` stamps the job ID when a job starts, and `-epilog` clears it when the job ends.
 
 ## Requirements
 
-Build time:
+**Build:** Linux, GCC or another compiler the Makefile accepts, and the CUDA toolkit headers for `nvml.h`.
 
-- Linux
-- GCC or another C compiler compatible with the Makefile
-- CUDA toolkit headers, for `nvml.h`
+**Run:** Slurm with the `gres/gpu` plugin configured, and the NVIDIA driver on any node that should report mappings.
 
-Run time:
-
-- NVIDIA driver providing `libnvidia-ml.so.1`, on any node where GPU mapping should actually happen
-- Slurm's `gres/gpu` plugin configured so `SLURM_JOB_GPUS` (or `CUDA_VISIBLE_DEVICES`) is exported to the job `Prolog` and `Epilog`
-
-`libnvidia-ml.so.1` is loaded with `dlopen` at run time rather than linked at build time, so the same binary starts cleanly on GPU-less nodes (login nodes, CPU-only compute nodes) and simply does nothing: `-init` and `-prolog`/`-epilog` find no NVML library, skip GPU mapping, and exit `0`.
+`libnvidia-ml.so.1` is loaded with `dlopen` at run time rather than linked at build time, so a single binary can be deployed fleet-wide. On a node with no driver, such as a login or CPU-only compute node, every mode finds no NVML, skips the mapping, and exits `0`.
 
 ## Build
 
@@ -25,41 +18,36 @@ Run time:
 make
 ```
 
-By default, the build expects CUDA at `/usr/local/cuda`, for `nvml.h` and the NVML type/constant declarations only — the resulting binary does not link against `libnvidia-ml`. If cuda is installed elsewhere, set `CUDA_HOME` to the correct path before running `make`. For example:
+The build looks for CUDA in `/usr/local/cuda`, and uses it only for `nvml.h` — the binary does not link against `libnvidia-ml`. Point `CUDA_HOME` elsewhere if needed:
 
 ```sh
 CUDA_HOME=/opt/cuda-13.2 make
 ```
 
-Install the utility to `/usr/local/sbin`:
+Install to `/usr/local/sbin`, and clean up:
 
 ```sh
 sudo make install
-```
-
-Remove the built executable with:
-
-```sh
 make clean
 ```
 
-## Modes
+## Setup
 
-### Initialize mappings
+### Create the mapping files
 
-Run on boot or whenever the available MIG configuration changes:
+Run `-init` at boot, and again whenever the MIG configuration changes:
 
 ```sh
 sudo dcgm-job-map -init
 ```
 
-This discovers every GPU on the node through NVML and creates one mapping file per device. A GPU in MIG mode gets one file per GPU instance, named `<gpu-index>.<gpu-instance-id>`; a GPU not in MIG mode gets a single file named `<gpu-index>`. Files are initialized with `0`, owned by root, and made world-readable (`0644`) — `-prolog` and `-epilog` run as root too (see below), so the files no longer need to be writable by the job user. The mapping directory is created during this mode if it does not already exist.
+This enumerates every GPU on the node through NVML and creates one file per device, initialized to `0`, owned by root, mode `0644`. A MIG-mode GPU gets one file per GPU instance named `<minor>.<gpu-instance-id>`; any other GPU gets a single file named `<minor>`. The mapping directory itself is created if absent, so its parent must exist and be writable.
 
-`-init` refuses to run when `SLURM_JOB_ID` is set, i.e. inside a Slurm job. It must see every device on the node to build a complete mapping; running it inside a job would restrict NVML and the device-node accessibility check to that job's allocated devices, quietly narrowing the node-wide file set down to one job's slice and resetting mapping files for every other device on the node in the process. Run `-init` at boot, or from an `ExecStartPre` as shown below, never from a job's prolog or epilog.
+Set `DCGM_HPC_JOB_MAPPING_DIR` to choose the directory; it defaults to `/var/run/dcgm_job_maps`. The same value has to reach the prolog and epilog, or they will update files the exporter never reads.
 
-The `DCGM_HPC_JOB_MAPPING_DIR` environment variable specifies the directory where mapping files are created. If not set, the default is `/var/run/dcgm_job_maps`. The `-init` mode creates the final directory automatically with mode `0755` when it does not exist. Its parent directory must already exist, and the process must have permission to create it.
+`-init` refuses to run with `SLURM_JOB_ID` set. It needs a node-wide view, and inside a job's cgroup NVML reports only that job's devices — it would then create files for one job's slice and reset every other device on the node.
 
-To initialize the mapping files automatically when the exporter starts, create a systemd drop-in for `nvidia-dcgm-exporter.service`:
+To initialize automatically alongside the exporter, drop in a unit override:
 
 ```sh
 sudo install -d /etc/systemd/system/nvidia-dcgm-exporter.service.d
@@ -73,38 +61,24 @@ sudo systemctl daemon-reload
 sudo systemctl restart nvidia-dcgm-exporter.service
 ```
 
-Verify the drop-in and exporter status with:
+Check it with `systemctl cat nvidia-dcgm-exporter.service` and `systemctl status nvidia-dcgm-exporter.service`.
 
-```sh
-systemctl cat nvidia-dcgm-exporter.service
-systemctl status nvidia-dcgm-exporter.service
-```
+### Wire up the prolog and epilog
 
-The same `DCGM_HPC_JOB_MAPPING_DIR` value must be available to the Slurm prolog and epilog commands so they update the files consumed by DCGM Exporter.
-
-### Slurm job prolog
-
-Configure as the Slurm **job** prolog — `Prolog` in `slurm.conf`, not `TaskProlog`:
+In `slurm.conf`:
 
 ```ini
 Prolog=/usr/local/sbin/dcgm-job-map -prolog
-```
-
-The utility reads `SLURM_JOB_GPUS` (falling back to `CUDA_VISIBLE_DEVICES`) to find the devices Slurm allocated to the job, and writes `SLURM_JOB_ID` to the matching mapping files. See [Device selection](#device-selection) for how each entry is resolved.
-
-By default `Prolog` runs when the job's first step launches on the node. To have the mapping written as soon as the allocation is granted instead — e.g. for an interactive `salloc` session that may never launch a step — add `PrologFlags=Alloc` in `slurm.conf`.
-
-### Slurm job epilog
-
-Configure as the Slurm **job** epilog — `Epilog` in `slurm.conf`, not `TaskEpilog`:
-
-```ini
 Epilog=/usr/local/sbin/dcgm-job-map -epilog
 ```
 
-This uses the same device selection and resets the selected mapping files to `0`.
+`-prolog` reads the devices Slurm allocated to the job and writes `SLURM_JOB_ID` to the matching files. `-epilog` doesn't look at devices at all: it resets every mapping file that holds its own `SLURM_JOB_ID`, so it clears exactly what the prolog wrote.
 
-**Use the job prolog/epilog, not the task prolog/epilog.** `TaskProlog`/`TaskEpilog` run once per *task*, inside `slurmstepd`, for every job step — including `srun` steps launched from within an existing allocation. A job that runs several `srun` steps in sequence (or an interactive `salloc` session followed by `srun`) would have its mapping file reset to `0` by `TaskEpilog` as soon as the first step finishes, even though the allocation — and the rest of the job — is still running:
+**Set `PrologFlags=RunInJob`.** It runs the prolog inside the job's cgroup, where NVML shows only the allocated devices, and that view is exact. Without it the prolog has to interpret Slurm's device numbers against the node's full device list, which is not reliable on MIG nodes — see [Device selection](#device-selection).
+
+`Prolog` runs when the job's first step launches. Add `PrologFlags=Alloc` to have the mapping written as soon as the allocation is granted, which matters for an interactive `salloc` session that may never launch a step.
+
+Use the **job** prolog and epilog, not `TaskProlog`/`TaskEpilog`. The task versions run once per task inside `slurmstepd`, for every step in the job. A job that runs several `srun` steps would have its mapping cleared as soon as the first step exits, while the allocation is still live:
 
 ```text
 $ salloc -G 2 -n 2
@@ -114,11 +88,32 @@ $ cat /var/run/dcgm_job_maps/*
 $ srun -G 1 ./train.py
 ... (runs fine) ...
 $ cat /var/run/dcgm_job_maps/*
-0        # <- wrong: the allocation is still active, but TaskEpilog already reset this
+0        # wrong: TaskEpilog cleared these, but the allocation is still running
 0
 ```
 
-`Prolog` and `Epilog` instead run once per **allocation**, via `slurmd` as root, so they fire once when the job starts and once when it ends — not once per step — which is what this tool needs.
+`Prolog` and `Epilog` run once per allocation, through `slurmd` as root, so they fire once at job start and once at job end.
+
+## Device selection
+
+Mapping files are named after each GPU's **minor number**, its `/dev/nvidia<minor>` node: `<minor>` for a full GPU and `<minor>.<gpu-instance-id>` for a MIG instance. Minor numbers are stable regardless of NVML enumeration order, so every mode agrees on the file name for a given device no matter how it was invoked.
+
+The allocated devices come from `SLURM_JOB_GPUS`, falling back to `CUDA_VISIBLE_DEVICES`. `CUDA_VISIBLE_DEVICES` takes priority when it holds UUIDs, since those name an exact device. Entries are resolved as follows:
+
+- **A plain number** is a Slurm gres index: a position in the node's device list, where a MIG-mode GPU contributes one entry per GPU instance rather than one for the whole GPU. This is not an NVML enumeration ordinal. On a node whose first GPU is partitioned into four instances, gres index `0` is that GPU's first instance and index `4` is the next device, not GPU 4. Run `slurmd -G` to see Slurm's own view of the list.
+- **A range** such as `4-7` expands to each gres index it covers.
+- **A `MIG-...` UUID** resolves straight to the instance handle, giving both the GPU instance ID and the parent GPU's minor number.
+- **A `GPU-...` UUID** resolves to a full GPU. If that GPU is in MIG mode, the entry doesn't say which instances the job holds, so all of them are mapped.
+
+### Why `RunInJob` matters
+
+Interpreting those numbers as positions in the node's device list is a guess, and on a MIG node with mixed profiles it is wrong. A job allocated GPU instances 3 and 5 of a partitioned A100 is handed `SLURM_JOB_GPUS=0,1`; read positionally against the node list, `1` resolves to instance 4 — a device the job never had.
+
+With `PrologFlags=RunInJob` the prolog runs inside the job's cgroup, where NVML enumerates only the job's own devices. When that view holds exactly as many devices as the allocation names, the visible set *is* the allocation and the numbers are never consulted. This is the path to rely on. It cannot misfire: a confined view never shows more devices than were allocated, and unconfined, an equal count means the job holds the whole node.
+
+The epilog does not run inside the job's cgroup even when `RunInJob` is set — it sees the entire node. That asymmetry is why it matches on job ID instead of resolving devices; resolving them would clear a different set of files than the prolog wrote and strand a job ID on the rest.
+
+This does assume the GPU index dcgm-exporter reports matches the device's minor number, which holds whenever DCGM runs unrestricted, as a host-level exporter normally does. To confirm on a given node, compare `nvidia-smi --query-gpu=index,name --format=csv` against `ls -la /dev/nvidia[0-9]*`.
 
 ## Options
 
@@ -126,26 +121,28 @@ $ cat /var/run/dcgm_job_maps/*
 -init      Create/reset mapping files for every full GPU and MIG GPU instance
            on the node; refuses to run inside a Slurm job
 -prolog    Write SLURM_JOB_ID to the mapping files for this job's allocated devices
--epilog    Reset the mapping files for this job's allocated devices to 0
+-epilog    Reset every mapping file holding SLURM_JOB_ID back to 0
 -print     Print intended writes without changing files
 -nonzero   Return non-zero for invalid arguments, NVML errors, or mapping errors
 -help      Show usage information
 ```
 
-Without `-nonzero`, the process always exits with status `0`. This will ensure that Slurm does not fail the job if the mapping utility fails.
+Without `-nonzero` the process always exits `0`, so a failure here never fails the job.
 
-For a safe dry run, set `SLURM_JOB_GPUS` the way Slurm would inside a job's `Prolog`/`Epilog`:
+Both `-prolog` and `-epilog` need a non-empty `SLURM_JOB_ID`. Only `-prolog` reads a device list, and a job that requested no GPU simply has nothing to map. `-epilog` needs no NVML at all, so it still clears its files on a node whose driver is unhealthy.
+
+Use `-print` to check device selection before deploying. It performs the same resolution and writes nothing, but needs the environment a real prolog would have:
 
 ```sh
 SLURM_JOB_ID=12345 SLURM_JOB_GPUS=0,1 \
   dcgm-job-map -prolog -print -nonzero
 ```
 
-## Sample Output
+## Example
 
-In this example, a MIG node job is allocated one full A100 GPU slice and two 20GB MIG instances. Root runs `-init` to set up the directories; the job `Prolog` writes the job ID to the mapping files for the devices Slurm allocated, and the job `Epilog` resets them to `0`.
+A node with four A100s, all in MIG mode. Root initializes the files, then a job takes one 7g.80gb instance and two 2g.20gb instances:
 
-```bash
+```console
 # nvidia-smi -L
 GPU 0: NVIDIA A100-SXM4-80GB (UUID: GPU-b614723c-e261-4605-066e-79daab4c00ff)
   MIG 7g.80gb     Device  0: (UUID: MIG-dc34c2fd-4bd7-52ad-a6d0-645dcd1794e4)
@@ -179,8 +176,11 @@ would write "0" to /var/run/dcgm_job_maps/3.3
 would write "0" to /var/run/dcgm_job_maps/3.4
 would write "0" to /var/run/dcgm_job_maps/3.5
 would write "0" to /var/run/dcgm_job_maps/3.6
+```
 
+From inside the resulting allocation, where NVML shows only the three allocated instances:
 
+```console
 $ salloc -G a100:1,a100.20gb:2
 salloc: Nodes gpu001 are ready for job
 
@@ -193,44 +193,14 @@ GPU 1: NVIDIA A100-SXM4-80GB (UUID: GPU-e52dfcc4-406d-a3d4-f787-4402b535877a)
 GPU 2: NVIDIA A100-SXM4-80GB (UUID: GPU-2812eb50-852a-8049-1257-d447ce043b27)
 GPU 3: NVIDIA A100-SXM4-80GB (UUID: GPU-c78d556a-38ea-a307-20b5-e0548e6169d1)
 
-$ echo $CUDA_VISIBLE_DEVICES
-MIG-dc34c2fd-4bd7-52ad-a6d0-645dcd1794e4,MIG-ec4c3916-65fa-5948-b9b5-9f21a2ddfcc0,MIG-676485be-683e-5129-83a5-f856e2ed922e
-
-$ /usr/local/sbin/dcgm-job-map -prolog -print
+$ dcgm-job-map -prolog -print
 would write "1474042" to /var/run/dcgm_job_maps/0.0
 would write "1474042" to /var/run/dcgm_job_maps/1.3
 would write "1474042" to /var/run/dcgm_job_maps/1.5
-
-$ /usr/local/sbin/dcgm-job-map -epilog -print
-would write "0" to /var/run/dcgm_job_maps/0.0
-would write "0" to /var/run/dcgm_job_maps/1.3
-would write "0" to /var/run/dcgm_job_maps/1.5
 ```
 
-## Device selection
-
-`-prolog` and `-epilog` run once per allocation, from the Slurm job `Prolog`/`Epilog`, via `slurmd` as root — **outside** the job's cgroup. NVML's device enumeration there is not restricted to this job's devices the way it would be inside the cgroup, so device identity instead comes directly from what Slurm tells the job it was allocated: `SLURM_JOB_GPUS`, or `CUDA_VISIBLE_DEVICES` when that is unset. `CUDA_VISIBLE_DEVICES` takes priority when it holds UUIDs, which name the exact device and need no numbering assumption at all.
-
-Every mapping file is named from each GPU's NVML **minor number** (its `/dev/nvidia<minor>` node) — `<minor>` for a full GPU, `<minor>.<gpu-instance-id>` for a MIG instance — never from its position in NVML's device list, so `-init` and `-prolog`/`-epilog` always agree on a file name for the same physical device or instance regardless of how each was run. Each entry in the allocated-device list is resolved to that identity as follows:
-
-- **A plain number** (e.g. `0`, `1`) is a **Slurm gres index**: a position in the node's device list, where a MIG-mode GPU contributes one entry *per GPU instance* rather than one entry for the whole GPU. This is *not* an NVML enumeration ordinal — on a node whose first GPU is partitioned into four instances, gres index `0` is that GPU's first instance and index `4` is the next device, not GPU 4. `slurmd -G` prints Slurm's own view of that list.
-- **A range** (e.g. `4-7`) expands to each gres index it covers.
-- **A `MIG-...` UUID** identifies one MIG GPU instance directly — `nvmlDeviceGetHandleByUUID` resolves straight to the instance handle, from which the GPU instance ID and the parent GPU's minor number are read.
-- **A `GPU-...` UUID** identifies a full GPU directly — looked up with `nvmlDeviceGetHandleByUUID`, then resolved to its minor number. If it turns out to be in MIG mode, the specific instance(s) allocated aren't identifiable from that entry alone, so every instance on that GPU is mapped.
-
-Slurm numbers gres devices across the **whole node**, so those numbers only line up with a whole-node view of NVML. A process confined to the job's cgroup — this program run from inside the job, or from a `Prolog`/`Epilog` under `PrologFlags=RunInJob` — sees NVML enumerate only the job's own devices, renumbered from zero, and node-wide indices would then select the wrong devices or run off the end of the table. One case is handled without the numbers: when the allocation names exactly as many devices as NVML can see, the visible set *is* the allocation, so every visible device is mapped directly. That covers a confined view of the full allocation as well as an unconfined job holding the whole node, and it cannot misfire on a partial allocation, since a confined view never shows more devices than were allocated. Outside that case, run `-prolog`/`-epilog` from the job `Prolog`/`Epilog` without `PrologFlags=RunInJob`.
-
-This assumes the GPU index dcgm-exporter reports for a device matches that device's minor number. That holds whenever DCGM itself runs unrestricted (the normal case for a host-level exporter), since NVML minor numbers and enumeration position coincide outside a cgroup. Confirm it once per node with `nvidia-smi --query-gpu=index,name --format=csv` alongside `ls -la /dev/nvidia[0-9]*` if in doubt.
-
-Verify device selection with `-print` before deploying; it performs the same resolution but writes nothing, and reports which variable the device list came from. `-print` needs `SLURM_JOB_GPUS` or `CUDA_VISIBLE_DEVICES` set in the environment to see anything, since those normally only exist inside an actual job's `Prolog`/`Epilog`:
-
-```sh
-SLURM_JOB_ID=12345 SLURM_JOB_GPUS=0,1 \
-  dcgm-job-map -prolog -print -nonzero
-```
-
-`-prolog` requires a non-empty `SLURM_JOB_ID`. `-epilog` does not require a job ID. Neither requires `SLURM_JOB_GPUS`/`CUDA_VISIBLE_DEVICES` to be set — a job that didn't request a GPU simply has nothing to map.
+Once the job ends, the epilog resets those same three files, having found `1474042` in them rather than by resolving devices a second time.
 
 ## License
 
-This project is licensed under the GNU General Public License, version 3. See [LICENSE](LICENSE).
+GNU General Public License, version 3. See [LICENSE](LICENSE).

@@ -1,4 +1,5 @@
 #include <ctype.h>
+#include <dirent.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <nvml.h>
@@ -89,7 +90,7 @@ static void usage(const char *prog)
         "  -init     Create/chmod mapping files for full GPUs and MIG GPU instances.\n"
         "            Refuses to run if SLURM_JOB_ID is set\n"
         "  -prolog   Write SLURM_JOB_ID to the allocated mapping files\n"
-        "  -epilog   Truncate allocated mapping files and write 0\n"
+        "  -epilog   Reset every mapping file holding SLURM_JOB_ID back to 0\n"
         "\n"
         "Options:\n"
         "  -print    Print what would be written instead of writing files\n"
@@ -97,15 +98,16 @@ static void usage(const char *prog)
         "  -help     Show this help message\n"
         "\n"
         "Device selection:\n"
-        "  -prolog and -epilog read the job's allocated devices from SLURM_JOB_GPUS or\n"
+        "  -prolog reads the job's allocated devices from SLURM_JOB_GPUS or\n"
         "  CUDA_VISIBLE_DEVICES. Each entry is a GPU/MIG instance UUID, or a Slurm gres\n"
         "  index -- a position in the node's device list, where a MIG-mode GPU\n"
         "  contributes one entry per GPU instance rather than one for the whole GPU.\n"
+        "  -epilog selects no devices: it clears whichever files hold SLURM_JOB_ID.\n"
         "\n"
         "Environment:\n"
         "  DCGM_HPC_JOB_MAPPING_DIR  Directory for job mapping files\n"
-        "  SLURM_JOB_ID              Job ID written by -prolog\n"
-        "  SLURM_JOB_GPUS            Devices allocated to the job (-prolog/-epilog)\n"
+        "  SLURM_JOB_ID              Job ID written by -prolog, matched by -epilog\n"
+        "  SLURM_JOB_GPUS            Devices allocated to the job (-prolog)\n"
         "  CUDA_VISIBLE_DEVICES      Preferred over SLURM_JOB_GPUS when it holds UUIDs,\n"
         "                            and used as a fallback when SLURM_JOB_GPUS is unset\n"
         "\n"
@@ -293,7 +295,7 @@ static void add_gpu_mig_maps(unsigned int minor, char maps[][32], unsigned int *
     }
 }
 
-/* Every device on the node, for -init. -prolog/-epilog use collect_job_maps() instead. */
+/* Every device on the node, for -init. -prolog uses collect_job_maps() instead. */
 static int collect_maps(char maps[][32], unsigned int *count)
 {
     *count = 0;
@@ -499,12 +501,7 @@ static void resolve_device_entry(const char *entry, char maps[][32], unsigned in
     }
 }
 
-/*
- * This job's mapping IDs, from Slurm's allocated-device env var. Run from the job Prolog/Epilog, NVML
- * enumeration is not restricted to the job's devices the way it is inside the job's cgroup, so device
- * identity comes from what Slurm says it allocated rather than from what this process can see -- except
- * in the confined case below.
- */
+/* This job's mapping IDs, from Slurm's allocated-device env var (-prolog). */
 static int collect_job_maps(char maps[][32], unsigned int *count)
 {
     const char *env = get_device_env();
@@ -521,13 +518,13 @@ static int collect_job_maps(char maps[][32], unsigned int *count)
         return -1;
 
     /*
-     * Slurm numbers devices across the whole node, but a process confined to the job's cgroup -- run
-     * from inside the job, or from a Prolog/Epilog under PrologFlags=RunInJob -- sees NVML enumerate
-     * only the job's own devices, renumbered from zero, so node-wide numbers would select the wrong
-     * ones. When the allocation names exactly as many devices as NVML can see, the visible set *is*
-     * the allocation and the numbers aren't needed. That also holds unconfined for a job holding the
-     * whole node, and can't misfire on a partial allocation: a confined view never shows more devices
-     * than were allocated.
+     * Under PrologFlags=RunInJob the prolog runs inside the job's cgroup, where NVML enumerates only
+     * the job's own devices. That view is exact, so when it holds as many devices as the allocation
+     * names, map all of them and skip the numbering entirely. This is the reliable path: Slurm's
+     * device numbers are not always positions in the node's device list -- a job allocated GPU
+     * instances 3 and 5 of a mixed-profile MIG GPU is handed "0,1" -- so the fallback below can pick
+     * the wrong instance. The check cannot misfire: a confined view never shows more devices than
+     * were allocated, and unconfined an equal count means the job holds the whole node.
      */
     if (!is_uuid_list(env) && count_device_entries(env) == node_device_count)
     {
@@ -556,6 +553,56 @@ static int write_maps(const char *dir, char maps[][32], unsigned int count, cons
     return rc;
 }
 
+/*
+ * Reset every mapping file holding this job's ID (-epilog). Deliberately identity-based rather than
+ * device-based: the epilog is not confined to the job's cgroup the way a PrologFlags=RunInJob prolog
+ * is, so it sees a different device list and would resolve the allocation to different files than the
+ * prolog wrote -- clearing the wrong ones and stranding a job ID on the right ones. Matching on the ID
+ * clears exactly what the prolog wrote, needs no NVML, and cannot be thrown off by device numbering.
+ */
+static int clear_job_maps(const char *dir, const char *job_id)
+{
+    DIR *d = opendir(dir);
+    struct dirent *ent;
+    int rc = 0;
+
+    if (!d)
+        return -1;
+
+    while ((ent = readdir(d)) != NULL)
+    {
+        char path[512];
+        char buf[64];
+        FILE *f;
+        size_t n;
+
+        if (ent->d_name[0] == '.')
+            continue;
+
+        snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name);
+
+        f = fopen(path, "r");
+        if (!f)
+            continue;
+
+        n = fread(buf, 1, sizeof(buf) - 1, f);
+        fclose(f);
+        buf[n] = '\0';
+
+        while (n > 0 && isspace((unsigned char)buf[n - 1]))
+            buf[--n] = '\0';
+
+        if (strcmp(buf, job_id) != 0)
+            continue;
+
+        if (write_map(dir, ent->d_name, "0", 0) != 0)
+            rc = 1;
+    }
+
+    closedir(d);
+    return rc;
+}
+
 /* Create root-owned, world-readable files for every full GPU and MIG GPU instance on the node. */
 static int run_init(const char *dir)
 {
@@ -571,8 +618,8 @@ static int run_init(const char *dir)
     return write_maps(dir, maps, count, "0", 1);
 }
 
-/* Write SLURM_JOB_ID during prolog, or 0 during epilog, to this job's mapped files. */
-static int run_job_mode(const char *dir, const char *value)
+/* Write SLURM_JOB_ID to the mapping files for this job's allocated devices (-prolog). */
+static int run_prolog(const char *dir, const char *job_id)
 {
     char maps[MAX_ITEMS][32];
     unsigned int count = 0;
@@ -580,7 +627,7 @@ static int run_job_mode(const char *dir, const char *value)
     if (collect_job_maps(maps, &count) != 0)
         return -1;
 
-    return write_maps(dir, maps, count, value, 0);
+    return write_maps(dir, maps, count, job_id, 0);
 }
 
 int main(int argc, char **argv)
@@ -632,6 +679,21 @@ int main(int argc, char **argv)
 
     const char *dir = get_mapping_dir();
 
+    /* -epilog matches on the job ID, so it needs no NVML and runs even where the driver is broken. */
+    if (run_mode == MODE_EPILOG)
+    {
+        const char *job_id = getenv("SLURM_JOB_ID");
+
+        if (!job_id || !*job_id)
+        {
+            fprintf(stderr, "-epilog requires SLURM_JOB_ID\n");
+            return nonzero ? 1 : 0;
+        }
+
+        rc = clear_job_maps(dir, job_id);
+        return nonzero ? rc : 0;
+    }
+
     /* No NVIDIA driver on this node is not an error for this program: skip mapping and exit clean. */
     if (load_nvml() != 0)
         return nonzero ? 1 : 0;
@@ -650,11 +712,7 @@ int main(int argc, char **argv)
     {
         const char *job_id = getenv("SLURM_JOB_ID");
 
-        rc = (job_id && *job_id) ? run_job_mode(dir, job_id) : 1;
-    }
-    else if (run_mode == MODE_EPILOG)
-    {
-        rc = run_job_mode(dir, "0");
+        rc = (job_id && *job_id) ? run_prolog(dir, job_id) : 1;
     }
 
     nvmlShutdown_p();
