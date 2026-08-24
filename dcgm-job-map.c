@@ -384,38 +384,26 @@ static unsigned int count_device_entries(const char *env)
 
 /*
  * The env var listing this job's allocated devices, or NULL if none is set (e.g. a job that requested
- * no GPU). *name, when non-NULL, receives which variable it came from.
+ * no GPU).
  *
  * Slurm's Prolog/Epilog environment gives the allocation as device numbers, not UUIDs -- even for a MIG
  * allocation, where the job itself would later see a MIG-<uuid> in CUDA_VISIBLE_DEVICES. SLURM_JOB_GPUS
  * is the authoritative form of that numbering, so it wins; CUDA_VISIBLE_DEVICES takes priority only when
  * it holds UUIDs, which name the exact device and need no numbering assumption at all.
  */
-static const char *get_device_env(const char **name)
+static const char *get_device_env(void)
 {
     const char *cvd = getenv("CUDA_VISIBLE_DEVICES");
     const char *job_gpus = getenv("SLURM_JOB_GPUS");
 
     if (cvd && *cvd && is_uuid_list(cvd))
-    {
-        if (name)
-            *name = "CUDA_VISIBLE_DEVICES";
         return cvd;
-    }
 
     if (job_gpus && *job_gpus)
-    {
-        if (name)
-            *name = "SLURM_JOB_GPUS";
         return job_gpus;
-    }
 
     if (cvd && *cvd)
-    {
-        if (name)
-            *name = "CUDA_VISIBLE_DEVICES";
         return cvd;
-    }
 
     return NULL;
 }
@@ -519,8 +507,7 @@ static void resolve_device_entry(const char *entry, char maps[][32], unsigned in
  */
 static int collect_job_maps(char maps[][32], unsigned int *count)
 {
-    const char *name = NULL;
-    const char *env = get_device_env(&name);
+    const char *env = get_device_env();
     char copy[1024];
     char *saveptr = NULL;
     char *tok;
@@ -533,9 +520,6 @@ static int collect_job_maps(char maps[][32], unsigned int *count)
     if (build_node_device_table() != 0)
         return -1;
 
-    if (print_only)
-        printf("allocated devices from %s=%s\n", name, env);
-
     /*
      * Slurm numbers devices across the whole node, but a process confined to the job's cgroup -- run
      * from inside the job, or from a Prolog/Epilog under PrologFlags=RunInJob -- sees NVML enumerate
@@ -547,9 +531,6 @@ static int collect_job_maps(char maps[][32], unsigned int *count)
      */
     if (!is_uuid_list(env) && count_device_entries(env) == node_device_count)
     {
-        if (print_only)
-            printf("all %u NVML-visible devices are allocated to this job: mapping them directly\n", node_device_count);
-
         add_all_node_devices(maps, count);
         return 0;
     }
