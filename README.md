@@ -15,7 +15,7 @@ Build time:
 Run time:
 
 - NVIDIA driver providing `libnvidia-ml.so.1`, on any node where GPU mapping should actually happen
-- Slurm's `gres/gpu` plugin configured so `CUDA_VISIBLE_DEVICES` (or at least `GPU_DEVICE_ORDINAL`) is exported to the job `Prolog` and `Epilog`
+- Slurm's `gres/gpu` plugin configured so `SLURM_JOB_GPUS` (or `CUDA_VISIBLE_DEVICES`) is exported to the job `Prolog` and `Epilog`
 
 `libnvidia-ml.so.1` is loaded with `dlopen` at run time rather than linked at build time, so the same binary starts cleanly on GPU-less nodes (login nodes, CPU-only compute nodes) and simply does nothing: `-init` and `-prolog`/`-epilog` find no NVML library, skip GPU mapping, and exit `0`.
 
@@ -90,7 +90,7 @@ Configure as the Slurm **job** prolog — `Prolog` in `slurm.conf`, not `TaskPro
 Prolog=/usr/local/sbin/dcgm-job-map -prolog
 ```
 
-The utility reads `CUDA_VISIBLE_DEVICES` (falling back to `GPU_DEVICE_ORDINAL`) to find the devices Slurm allocated to the job, and writes `SLURM_JOB_ID` to the matching mapping files.
+The utility reads `SLURM_JOB_GPUS` (falling back to `CUDA_VISIBLE_DEVICES`) to find the devices Slurm allocated to the job, and writes `SLURM_JOB_ID` to the matching mapping files. See [Device selection](#device-selection) for how each entry is resolved.
 
 By default `Prolog` runs when the job's first step launches on the node. To have the mapping written as soon as the allocation is granted instead — e.g. for an interactive `salloc` session that may never launch a step — add `PrologFlags=Alloc` in `slurm.conf`.
 
@@ -134,10 +134,10 @@ $ cat /var/run/dcgm_job_maps/*
 
 Without `-nonzero`, the process always exits with status `0`. This will ensure that Slurm does not fail the job if the mapping utility fails.
 
-For a safe dry run, set `CUDA_VISIBLE_DEVICES` the way Slurm would inside a job's `Prolog`/`Epilog`:
+For a safe dry run, set `SLURM_JOB_GPUS` the way Slurm would inside a job's `Prolog`/`Epilog`:
 
 ```sh
-SLURM_JOB_ID=12345 CUDA_VISIBLE_DEVICES=0,1 \
+SLURM_JOB_ID=12345 SLURM_JOB_GPUS=0,1 \
   dcgm-job-map -prolog -print -nonzero
 ```
 
@@ -209,25 +209,27 @@ would write "0" to /var/run/dcgm_job_maps/1.5
 
 ## Device selection
 
-`-prolog` and `-epilog` run once per allocation, from the Slurm job `Prolog`/`Epilog`, via `slurmd` as root — **outside** the job's cgroup. That means neither NVML's device enumeration nor a `/dev/nvidia<minor>` `open()` test is restricted to this job's devices the way it would be inside the cgroup, so device identity instead comes directly from what Slurm tells the job it was allocated: the `CUDA_VISIBLE_DEVICES` environment variable, falling back to `GPU_DEVICE_ORDINAL` if that is unset.
+`-prolog` and `-epilog` run once per allocation, from the Slurm job `Prolog`/`Epilog`, via `slurmd` as root — **outside** the job's cgroup. NVML's device enumeration there is not restricted to this job's devices the way it would be inside the cgroup, so device identity instead comes directly from what Slurm tells the job it was allocated: `SLURM_JOB_GPUS`, or `CUDA_VISIBLE_DEVICES` when that is unset. `CUDA_VISIBLE_DEVICES` takes priority when it holds UUIDs, which name the exact device and need no numbering assumption at all.
 
-Every mapping file is still named from each GPU's NVML **minor number** (its `/dev/nvidia<minor>` node) — `<minor>` for a full GPU, `<minor>.<gpu-instance-id>` for a MIG instance — never from its position in NVML's device list, so `-init` and `-prolog`/`-epilog` always agree on a file name for the same physical device or instance regardless of how each was run. Each entry in `CUDA_VISIBLE_DEVICES`/`GPU_DEVICE_ORDINAL` is resolved to that identity as follows:
+Every mapping file is named from each GPU's NVML **minor number** (its `/dev/nvidia<minor>` node) — `<minor>` for a full GPU, `<minor>.<gpu-instance-id>` for a MIG instance — never from its position in NVML's device list, so `-init` and `-prolog`/`-epilog` always agree on a file name for the same physical device or instance regardless of how each was run. Each entry in the allocated-device list is resolved to that identity as follows:
 
-- **A plain number** (e.g. `0`, `1`) is an NVML enumeration ordinal — looked up with `nvmlDeviceGetHandleByIndex_v2`, then resolved to its minor number.
-- **A `GPU-...` UUID** identifies a full GPU directly — looked up with `nvmlDeviceGetHandleByUUID`, then resolved to its minor number.
+- **A plain number** (e.g. `0`, `1`) is a **Slurm gres index**: a position in the node's device list, where a MIG-mode GPU contributes one entry *per GPU instance* rather than one entry for the whole GPU. This is *not* an NVML enumeration ordinal — on a node whose first GPU is partitioned into four instances, gres index `0` is that GPU's first instance and index `4` is the next device, not GPU 4. `slurmd -G` prints Slurm's own view of that list.
+- **A range** (e.g. `4-7`) expands to each gres index it covers.
 - **A `MIG-...` UUID** identifies one MIG GPU instance directly — `nvmlDeviceGetHandleByUUID` resolves straight to the instance handle, from which the GPU instance ID and the parent GPU's minor number are read.
-- If an ordinal or `GPU-...` UUID resolves to a GPU that turns out to be in MIG mode, the specific instance(s) allocated aren't identifiable from that entry alone, so every instance on that GPU is mapped.
+- **A `GPU-...` UUID** identifies a full GPU directly — looked up with `nvmlDeviceGetHandleByUUID`, then resolved to its minor number. If it turns out to be in MIG mode, the specific instance(s) allocated aren't identifiable from that entry alone, so every instance on that GPU is mapped.
+
+Slurm numbers gres devices across the **whole node**, so those numbers only line up with a whole-node view of NVML. A process confined to the job's cgroup — this program run from inside the job, or from a `Prolog`/`Epilog` under `PrologFlags=RunInJob` — sees NVML enumerate only the job's own devices, renumbered from zero, and node-wide indices would then select the wrong devices or run off the end of the table. One case is handled without the numbers: when the allocation names exactly as many devices as NVML can see, the visible set *is* the allocation, so every visible device is mapped directly. That covers a confined view of the full allocation as well as an unconfined job holding the whole node, and it cannot misfire on a partial allocation, since a confined view never shows more devices than were allocated. Outside that case, run `-prolog`/`-epilog` from the job `Prolog`/`Epilog` without `PrologFlags=RunInJob`.
 
 This assumes the GPU index dcgm-exporter reports for a device matches that device's minor number. That holds whenever DCGM itself runs unrestricted (the normal case for a host-level exporter), since NVML minor numbers and enumeration position coincide outside a cgroup. Confirm it once per node with `nvidia-smi --query-gpu=index,name --format=csv` alongside `ls -la /dev/nvidia[0-9]*` if in doubt.
 
-Verify device selection with `-print` before deploying; it performs the same resolution but writes nothing. `-print` needs `CUDA_VISIBLE_DEVICES` or `GPU_DEVICE_ORDINAL` set in the environment to see anything, since those normally only exist inside an actual job's `Prolog`/`Epilog`:
+Verify device selection with `-print` before deploying; it performs the same resolution but writes nothing, and reports which variable the device list came from. `-print` needs `SLURM_JOB_GPUS` or `CUDA_VISIBLE_DEVICES` set in the environment to see anything, since those normally only exist inside an actual job's `Prolog`/`Epilog`:
 
 ```sh
-SLURM_JOB_ID=12345 CUDA_VISIBLE_DEVICES=0,1 \
+SLURM_JOB_ID=12345 SLURM_JOB_GPUS=0,1 \
   dcgm-job-map -prolog -print -nonzero
 ```
 
-`-prolog` requires a non-empty `SLURM_JOB_ID`. `-epilog` does not require a job ID. Neither requires `CUDA_VISIBLE_DEVICES`/`GPU_DEVICE_ORDINAL` to be set — a job that didn't request a GPU simply has nothing to map.
+`-prolog` requires a non-empty `SLURM_JOB_ID`. `-epilog` does not require a job ID. Neither requires `SLURM_JOB_GPUS`/`CUDA_VISIBLE_DEVICES` to be set — a job that didn't request a GPU simply has nothing to map.
 
 ## License
 
