@@ -74,7 +74,7 @@ Epilog=/usr/local/sbin/dcgm-job-map -epilog
 
 `-prolog` reads the devices Slurm allocated to the job and writes `SLURM_JOB_ID` to the matching files. `-epilog` doesn't look at devices at all: it resets every mapping file that holds its own `SLURM_JOB_ID`, so it clears exactly what the prolog wrote.
 
-**Set `PrologFlags=RunInJob`.** It runs the prolog inside the job's cgroup, where NVML shows only the allocated devices, and that view is exact. Without it the prolog has to interpret Slurm's device numbers against the node's full device list, which is not reliable on MIG nodes — see [Device selection](#device-selection).
+Both work with or without `PrologFlags=RunInJob`. The prolog adapts to whichever view of the node it gets, and the epilog is unaffected by the setting either way. See [Device selection](#device-selection) for how each case resolves.
 
 `Prolog` runs when the job's first step launches. Add `PrologFlags=Alloc` to have the mapping written as soon as the allocation is granted, which matters for an interactive `salloc` session that may never launch a step.
 
@@ -105,13 +105,13 @@ The allocated devices come from `SLURM_JOB_GPUS`, falling back to `CUDA_VISIBLE_
 - **A `MIG-...` UUID** resolves straight to the instance handle, giving both the GPU instance ID and the parent GPU's minor number.
 - **A `GPU-...` UUID** resolves to a full GPU. If that GPU is in MIG mode, the entry doesn't say which instances the job holds, so all of them are mapped.
 
-### Why `RunInJob` matters
+### `PrologFlags=RunInJob`
 
-Interpreting those numbers as positions in the node's device list is a guess, and on a MIG node with mixed profiles it is wrong. A job allocated GPU instances 3 and 5 of a partitioned A100 is handed `SLURM_JOB_GPUS=0,1`; read positionally against the node list, `1` resolves to instance 4 — a device the job never had.
+The prolog handles both cases. With `RunInJob` it runs inside the job's cgroup, where NVML enumerates only the job's own devices; when that view holds exactly as many devices as the allocation names, the visible set *is* the allocation and the device numbers are never consulted. Without `RunInJob` it sees the whole node and resolves the numbers positionally. Neither can misfire on the count check itself: a confined view never shows more devices than were allocated, and unconfined, an equal count means the job holds the entire node.
 
-With `PrologFlags=RunInJob` the prolog runs inside the job's cgroup, where NVML enumerates only the job's own devices. When that view holds exactly as many devices as the allocation names, the visible set *is* the allocation and the numbers are never consulted. This is the path to rely on. It cannot misfire: a confined view never shows more devices than were allocated, and unconfined, an equal count means the job holds the whole node.
+The epilog is unaffected either way. It never runs inside the job's cgroup, even with `RunInJob` set, so it always sees the whole node — which is exactly why it matches on job ID rather than resolving devices a second time. Resolving them would clear a different set of files than the prolog wrote and strand the job ID on the rest.
 
-The epilog does not run inside the job's cgroup even when `RunInJob` is set — it sees the entire node. That asymmetry is why it matches on job ID instead of resolving devices; resolving them would clear a different set of files than the prolog wrote and strand a job ID on the rest.
+Slurm's numbering is node-global, and it accounts for devices already in use. Two concurrent jobs on a partitioned node land on disjoint files: a single-GPU job takes gres index `0`, and a five-GPU job starting while it runs is handed `1,2,3,4,5`, not `0,1,2,3,4`.
 
 This does assume the GPU index dcgm-exporter reports matches the device's minor number, which holds whenever DCGM runs unrestricted, as a host-level exporter normally does. To confirm on a given node, compare `nvidia-smi --query-gpu=index,name --format=csv` against `ls -la /dev/nvidia[0-9]*`.
 
