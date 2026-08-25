@@ -6,10 +6,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #define DEFAULT_JOB_MAPPING_DIR "/var/run/dcgm_job_maps"
+#define DEFAULT_SLURMD_SPOOL_DIR "/var/spool/slurmd"
 #define MAX_ITEMS 1024
+#define MAX_JOB_ID 32
 
 /*
  * NVML is dlopen'd rather than linked: this program also runs on nodes with no NVIDIA driver, where
@@ -71,6 +75,7 @@ enum mode
 {
     MODE_NONE,
     MODE_INIT,
+    MODE_RESET,
     MODE_PROLOG,
     MODE_EPILOG
 };
@@ -82,12 +87,15 @@ static enum mode run_mode = MODE_NONE;
 static void usage(const char *prog)
 {
     printf(
-        "Usage: %s -init|-prolog|-epilog [-print] [-nonzero] [-help]\n"
+        "Usage: %s -init|-reset|-prolog|-epilog [-print] [-nonzero] [-help]\n"
         "\n"
         "Manage dcgm_exporter Slurm job mapping files.\n"
         "\n"
         "Modes:\n"
-        "  -init     Create/chmod mapping files for full GPUs and MIG GPU instances.\n"
+        "  -init     Create/chmod mapping files for full GPUs and MIG GPU instances,\n"
+        "            resetting each to 0 unless it holds the ID of a job slurmd is\n"
+        "            still running. Refuses to run if SLURM_JOB_ID is set\n"
+        "  -reset    Delete every mapping file, then recreate them all holding 0.\n"
         "            Refuses to run if SLURM_JOB_ID is set\n"
         "  -prolog   Write SLURM_JOB_ID to the allocated mapping files\n"
         "  -epilog   Reset every mapping file holding SLURM_JOB_ID back to 0\n"
@@ -104,16 +112,28 @@ static void usage(const char *prog)
         "  contributes one entry per GPU instance rather than one for the whole GPU.\n"
         "  -epilog selects no devices: it clears whichever files hold SLURM_JOB_ID.\n"
         "\n"
+        "Running jobs:\n"
+        "  -init keeps a mapping whose job is still running on the node, found by\n"
+        "  listing slurmd's spool directory -- the same local, RPC-free check\n"
+        "  `scontrol listjobs` makes. When that directory cannot be read, every\n"
+        "  non-zero mapping is kept: a stale ID is corrected by the next job's\n"
+        "  prolog, an erased one is not. Use -reset to clear them regardless.\n"
+        "\n"
         "Environment:\n"
         "  DCGM_HPC_JOB_MAPPING_DIR  Directory for job mapping files\n"
+        "  DCGM_SLURMD_SPOOL_DIR     slurmd spool dir, overriding SlurmdSpoolDir from\n"
+        "                            slurm.conf (-init)\n"
+        "  SLURM_CONF                slurm.conf to read SlurmdSpoolDir from (-init)\n"
         "  SLURM_JOB_ID              Job ID written by -prolog, matched by -epilog\n"
         "  SLURM_JOB_GPUS            Devices allocated to the job (-prolog)\n"
         "  CUDA_VISIBLE_DEVICES      Preferred over SLURM_JOB_GPUS when it holds UUIDs,\n"
         "                            and used as a fallback when SLURM_JOB_GPUS is unset\n"
         "\n"
-        "Default mapping dir: %s\n",
+        "Default mapping dir: %s\n"
+        "Default slurmd spool dir: %s\n",
         prog,
-        DEFAULT_JOB_MAPPING_DIR);
+        DEFAULT_JOB_MAPPING_DIR,
+        DEFAULT_SLURMD_SPOOL_DIR);
 }
 
 static const char *get_mapping_dir(void)
@@ -147,6 +167,38 @@ static int write_map(const char *dir, const char *map_id, const char *value, int
         chmod(path, 0644);
 
     return 0;
+}
+
+/* Read one mapping file's contents, trimmed of the trailing newline write_map() adds. */
+static int read_map(const char *dir, const char *map_id, char *buf, size_t len)
+{
+    char path[512];
+    FILE *f;
+    size_t n;
+
+    snprintf(path, sizeof(path), "%s/%s", dir, map_id);
+
+    f = fopen(path, "r");
+    if (!f)
+        return -1;
+
+    n = fread(buf, 1, len - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+
+    while (n > 0 && isspace((unsigned char)buf[n - 1]))
+        buf[--n] = '\0';
+
+    return 0;
+}
+
+/* Apply -init's permissions to a file it is leaving untouched otherwise. */
+static void chmod_map(const char *dir, const char *map_id)
+{
+    char path[512];
+
+    snprintf(path, sizeof(path), "%s/%s", dir, map_id);
+    chmod(path, 0644);
 }
 
 /* Append a mapping ID, ignoring duplicates and silently dropping it if the fixed-size array is full. */
@@ -554,6 +606,225 @@ static int write_maps(const char *dir, char maps[][32], unsigned int count, cons
 }
 
 /*
+ * Job IDs slurmd is currently running on this node, filled in by load_running_jobs().
+ *
+ * `scontrol listjobs` answers this without a slurmctld RPC by listing SlurmdSpoolDir, and -init does the
+ * same: slurmd keeps one unix socket per step there, named "<node>_<jobid>.<stepid>", and gives a batch
+ * job its own "job<jobid>" directory. One getdents pass, no daemon contacted, no lock taken.
+ */
+static char running_jobs[MAX_ITEMS][MAX_JOB_ID];
+static unsigned int running_job_count = 0;
+
+/* Read SlurmdSpoolDir out of a slurm.conf, ignoring a trailing comment. */
+static int conf_lookup_spool_dir(const char *conf_path, char *out, size_t len)
+{
+    FILE *f = fopen(conf_path, "r");
+    char line[1024];
+    int found = 0;
+
+    if (!f)
+        return -1;
+
+    while (!found && fgets(line, sizeof(line), f))
+    {
+        char *p = line;
+        char *value;
+
+        while (isspace((unsigned char)*p))
+            p++;
+
+        if (strncasecmp(p, "SlurmdSpoolDir", 14) != 0)
+            continue;
+
+        p += 14;
+        while (isspace((unsigned char)*p))
+            p++;
+
+        if (*p++ != '=')
+            continue;
+
+        while (isspace((unsigned char)*p))
+            p++;
+
+        value = p;
+        while (*p && !isspace((unsigned char)*p) && *p != '#')
+            p++;
+        *p = '\0';
+
+        if (!*value)
+            continue;
+
+        snprintf(out, len, "%s", value);
+        found = 1;
+    }
+
+    fclose(f);
+    return found ? 0 : -1;
+}
+
+/* Substitute the %n/%h node-name escapes slurm.conf allows in a path. */
+static void expand_conf_path(const char *raw, char *out, size_t len)
+{
+    char host[256];
+    char *dot;
+    size_t o = 0;
+
+    if (gethostname(host, sizeof(host)) != 0)
+        host[0] = '\0';
+
+    host[sizeof(host) - 1] = '\0';
+    if ((dot = strchr(host, '.')) != NULL)
+        *dot = '\0';
+
+    for (const char *p = raw; *p && o + 1 < len; p++)
+    {
+        if (*p == '%' && (p[1] == 'n' || p[1] == 'h'))
+        {
+            for (const char *h = host; *h && o + 1 < len; h++)
+                out[o++] = *h;
+
+            p++;
+            continue;
+        }
+
+        out[o++] = *p;
+    }
+
+    out[o] = '\0';
+}
+
+/*
+ * Where slurmd keeps its per-step sockets. Configless clusters have no /etc/slurm/slurm.conf, so the
+ * cached copy slurmd writes under /run is checked too -- the same two locations scontrol tries.
+ */
+static const char *get_spool_dir(void)
+{
+    static char resolved[512];
+    const char *env = getenv("DCGM_SLURMD_SPOOL_DIR");
+    const char *conf = getenv("SLURM_CONF");
+    char raw[512];
+
+    if (env && *env)
+        return env;
+
+    if (resolved[0])
+        return resolved;
+
+    if ((conf && *conf && conf_lookup_spool_dir(conf, raw, sizeof(raw)) == 0) ||
+        conf_lookup_spool_dir("/etc/slurm/slurm.conf", raw, sizeof(raw)) == 0 ||
+        conf_lookup_spool_dir("/run/slurm/conf/slurm.conf", raw, sizeof(raw)) == 0)
+        expand_conf_path(raw, resolved, sizeof(resolved));
+    else
+        snprintf(resolved, sizeof(resolved), "%s", DEFAULT_SLURMD_SPOOL_DIR);
+
+    return resolved;
+}
+
+/* "<node>_<jobid>.<stepid>" -> jobid. A node name may contain '_', so the split is the last one. */
+static int step_socket_job_id(const char *name, char *out, size_t len)
+{
+    const char *sep = strrchr(name, '_');
+    const char *end;
+    size_t n;
+
+    if (!sep)
+        return -1;
+
+    sep++;
+    for (end = sep; isdigit((unsigned char)*end); end++)
+        ;
+
+    if (end == sep || *end != '.' || !all_digits(end + 1))
+        return -1;
+
+    n = (size_t)(end - sep);
+    if (n >= len)
+        return -1;
+
+    snprintf(out, n + 1, "%s", sep);
+    return 0;
+}
+
+/* "job<jobid>" -> jobid. slurmd zero-pads the name to five digits, so 42 arrives as "job00042". */
+static int batch_dir_job_id(const char *name, char *out, size_t len)
+{
+    const char *digits = name + 3;
+
+    if (strncmp(name, "job", 3) != 0 || !all_digits(digits))
+        return -1;
+
+    while (digits[0] == '0' && digits[1])
+        digits++;
+
+    if (strlen(digits) >= len)
+        return -1;
+
+    snprintf(out, len, "%s", digits);
+    return 0;
+}
+
+static void add_running_job(const char *job_id)
+{
+    for (unsigned int i = 0; i < running_job_count; i++)
+    {
+        if (strcmp(running_jobs[i], job_id) == 0)
+            return;
+    }
+
+    if (running_job_count >= MAX_ITEMS)
+        return;
+
+    snprintf(running_jobs[running_job_count], sizeof(running_jobs[0]), "%s", job_id);
+    running_job_count++;
+}
+
+/*
+ * Collect this node's running jobs. Returns -1 when the spool directory can't be read, which the caller
+ * has to tell apart from a node that is simply idle: an empty list and an unusable one mean the opposite
+ * thing for every mapping file on the node.
+ */
+static int load_running_jobs(void)
+{
+    const char *spool = get_spool_dir();
+    DIR *d = opendir(spool);
+    struct dirent *ent;
+
+    running_job_count = 0;
+
+    if (!d)
+    {
+        fprintf(stderr, "dcgm-job-map: cannot list slurmd spool dir %s: %s\n", spool, strerror(errno));
+        return -1;
+    }
+
+    while ((ent = readdir(d)) != NULL)
+    {
+        char job_id[MAX_JOB_ID];
+
+        if (ent->d_name[0] == '.')
+            continue;
+
+        if (step_socket_job_id(ent->d_name, job_id, sizeof(job_id)) == 0 ||
+            batch_dir_job_id(ent->d_name, job_id, sizeof(job_id)) == 0)
+            add_running_job(job_id);
+    }
+
+    closedir(d);
+    return 0;
+}
+
+static int job_is_running(const char *job_id)
+{
+    for (unsigned int i = 0; i < running_job_count; i++)
+    {
+        if (strcmp(running_jobs[i], job_id) == 0)
+            return 1;
+    }
+
+    return 0;
+}
+
+/*
  * Reset every mapping file holding this job's ID (-epilog). Deliberately identity-based rather than
  * device-based: the epilog is not confined to the job's cgroup the way a PrologFlags=RunInJob prolog
  * is, so it sees a different device list and would resolve the allocation to different files than the
@@ -571,26 +842,13 @@ static int clear_job_maps(const char *dir, const char *job_id)
 
     while ((ent = readdir(d)) != NULL)
     {
-        char path[512];
         char buf[64];
-        FILE *f;
-        size_t n;
 
         if (ent->d_name[0] == '.')
             continue;
 
-        snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name);
-
-        f = fopen(path, "r");
-        if (!f)
+        if (read_map(dir, ent->d_name, buf, sizeof(buf)) != 0)
             continue;
-
-        n = fread(buf, 1, sizeof(buf) - 1, f);
-        fclose(f);
-        buf[n] = '\0';
-
-        while (n > 0 && isspace((unsigned char)buf[n - 1]))
-            buf[--n] = '\0';
 
         if (strcmp(buf, job_id) != 0)
             continue;
@@ -603,11 +861,18 @@ static int clear_job_maps(const char *dir, const char *job_id)
     return rc;
 }
 
-/* Create root-owned, world-readable files for every full GPU and MIG GPU instance on the node. */
+/*
+ * Create root-owned, world-readable files for every full GPU and MIG GPU instance on the node, resetting
+ * each to 0 -- except one already holding the ID of a job slurmd is still running. Restarting
+ * dcgm-exporter re-runs -init under a live allocation, and zeroing that mapping would drop the job's
+ * metrics for the rest of its run: nothing writes the ID again until the job's own epilog clears it.
+ */
 static int run_init(const char *dir)
 {
     char maps[MAX_ITEMS][32];
     unsigned int count = 0;
+    int jobs_known;
+    int rc = 0;
 
     if (collect_maps(maps, &count) != 0)
         return -1;
@@ -615,7 +880,99 @@ static int run_init(const char *dir)
     if (!print_only && mkdir(dir, 0755) != 0 && errno != EEXIST)
         return -1;
 
-    return write_maps(dir, maps, count, "0", 1);
+    /*
+     * With no job list to check against, keep every non-zero ID rather than risk erasing a live one. A
+     * stale ID survives only until the next job lands on that device and its prolog overwrites it; an
+     * erased one is gone for the rest of the job it belonged to. -reset is the way to clear them anyway.
+     */
+    jobs_known = load_running_jobs() == 0;
+    if (!jobs_known)
+        rc = 1;
+
+    for (unsigned int i = 0; i < count; i++)
+    {
+        char held[64];
+
+        if (read_map(dir, maps[i], held, sizeof(held)) == 0 && *held && strcmp(held, "0") != 0 &&
+            (!jobs_known || job_is_running(held)))
+        {
+            if (print_only)
+                printf("would keep \"%s\" in %s/%s\n", held, dir, maps[i]);
+            else
+                chmod_map(dir, maps[i]);
+
+            continue;
+        }
+
+        if (write_map(dir, maps[i], "0", 1) != 0)
+            rc = 1;
+    }
+
+    return rc;
+}
+
+/* Delete every mapping file, so a device that no longer exists leaves none behind. */
+static int remove_all_maps(const char *dir)
+{
+    DIR *d = opendir(dir);
+    struct dirent *ent;
+    int rc = 0;
+
+    if (!d)
+        return errno == ENOENT ? 0 : -1;
+
+    while ((ent = readdir(d)) != NULL)
+    {
+        char path[512];
+        struct stat st;
+
+        if (ent->d_name[0] == '.')
+            continue;
+
+        snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name);
+
+        /* Mapping files are plain files; leave anything else in the directory alone. */
+        if (stat(path, &st) != 0 || !S_ISREG(st.st_mode))
+            continue;
+
+        if (print_only)
+        {
+            printf("would remove %s\n", path);
+            continue;
+        }
+
+        if (unlink(path) != 0)
+            rc = 1;
+    }
+
+    closedir(d);
+    return rc;
+}
+
+/*
+ * Discard every mapping, running job or not, and recreate the files from the node's current devices
+ * (-reset). This is -init without the running-job check, plus the delete pass that clears out files for
+ * devices that are gone -- the mode to run after a MIG reconfiguration, or to fix mappings by hand.
+ */
+static int run_reset(const char *dir)
+{
+    char maps[MAX_ITEMS][32];
+    unsigned int count = 0;
+    int rc = 0;
+
+    if (collect_maps(maps, &count) != 0)
+        return -1;
+
+    if (!print_only && mkdir(dir, 0755) != 0 && errno != EEXIST)
+        return -1;
+
+    if (remove_all_maps(dir) != 0)
+        rc = 1;
+
+    if (write_maps(dir, maps, count, "0", 1) != 0)
+        rc = 1;
+
+    return rc;
 }
 
 /* Write SLURM_JOB_ID to the mapping files for this job's allocated devices (-prolog). */
@@ -638,6 +995,8 @@ int main(int argc, char **argv)
     {
         if (strcmp(argv[i], "-init") == 0)
             run_mode = MODE_INIT;
+        else if (strcmp(argv[i], "-reset") == 0)
+            run_mode = MODE_RESET;
         else if (strcmp(argv[i], "-prolog") == 0)
             run_mode = MODE_PROLOG;
         else if (strcmp(argv[i], "-epilog") == 0)
@@ -665,14 +1024,20 @@ int main(int argc, char **argv)
         return nonzero ? 2 : 0;
     }
 
-    /* -init needs the whole node; inside a job's cgroup it would only see that job's devices. */
-    if (run_mode == MODE_INIT)
+    /*
+     * -init and -reset need the whole node; inside a job's cgroup they would only see that job's
+     * devices, creating files for one job's slice and resetting every other device on the node.
+     */
+    if (run_mode == MODE_INIT || run_mode == MODE_RESET)
     {
         const char *job_id = getenv("SLURM_JOB_ID");
 
         if (job_id && *job_id)
         {
-            fprintf(stderr, "-init must not run inside a Slurm job (SLURM_JOB_ID=%s is set)\n", job_id);
+            fprintf(stderr,
+                    "%s must not run inside a Slurm job (SLURM_JOB_ID=%s is set)\n",
+                    run_mode == MODE_INIT ? "-init" : "-reset",
+                    job_id);
             return nonzero ? 1 : 0;
         }
     }
@@ -707,6 +1072,10 @@ int main(int argc, char **argv)
     if (run_mode == MODE_INIT)
     {
         rc = run_init(dir);
+    }
+    else if (run_mode == MODE_RESET)
+    {
+        rc = run_reset(dir);
     }
     else if (run_mode == MODE_PROLOG)
     {
