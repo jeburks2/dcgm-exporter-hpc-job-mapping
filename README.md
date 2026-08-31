@@ -2,7 +2,7 @@
 
 A small C utility that records which Slurm job is using each GPU, for use with [DCGM Exporter](https://github.com/NVIDIA/dcgm-exporter)'s HPC job mapping. It maintains one file per GPU (or per MIG GPU instance) containing the job ID currently running on it, so exported GPU metrics can be attributed to jobs.
 
-Three modes cover the lifecycle: `-init` creates the files at boot, `-prolog` stamps the job ID when a job starts, and `-epilog` clears it when the job ends.
+Four modes cover the lifecycle: `-init` creates the files at boot, `-prolog` stamps the job ID when a job starts, `-epilog` clears it when the job ends, and `-reset` wipes every mapping back to `0`.
 
 ## Requirements
 
@@ -35,13 +35,15 @@ make clean
 
 ### Create the mapping files
 
-Run `-init` at boot, and again whenever the MIG configuration changes:
+Run `-init` at boot:
 
 ```sh
 sudo dcgm-job-map -init
 ```
 
-This enumerates every GPU on the node through NVML and creates one file per device, initialized to `0`, owned by root, mode `0644`. A MIG-mode GPU gets one file per GPU instance named `<minor>.<gpu-instance-id>`; any other GPU gets a single file named `<minor>`. The mapping directory itself is created if absent, so its parent must exist and be writable.
+This enumerates every GPU on the node through NVML and creates one file per device, owned by root, mode `0644`. A MIG-mode GPU gets one file per GPU instance named `<minor>.<gpu-instance-id>`; any other GPU gets a single file named `<minor>`. The mapping directory itself is created if absent, so its parent must exist and be writable.
+
+Every file is reset to `0`, except one that already holds the ID of a job still running on the node — see [Keeping live mappings](#keeping-live-mappings). Use [`-reset`](#clearing-every-mapping) to clear those too.
 
 Set `DCGM_HPC_JOB_MAPPING_DIR` to choose the directory; it defaults to `/var/run/dcgm_job_maps`. The same value has to reach the prolog and epilog, or they will update files the exporter never reads.
 
@@ -62,6 +64,42 @@ sudo systemctl restart nvidia-dcgm-exporter.service
 ```
 
 Check it with `systemctl cat nvidia-dcgm-exporter.service` and `systemctl status nvidia-dcgm-exporter.service`.
+
+### Keeping live mappings
+
+That `ExecStartPre` fires on every exporter restart, not just at boot, and restarts happen while jobs are running. A blanket reset to `0` would strand those jobs: nothing rewrites a mapping between the prolog and the epilog, so the GPUs stay unattributed for the rest of the job.
+
+So `-init` keeps a non-zero mapping whose job is still running on the node. It finds those jobs the same way `scontrol listjobs` does — by listing `SlurmdSpoolDir`, where `slurmd` keeps one unix socket per running step, named `<node>_<jobid>.<stepid>`, plus a `job<jobid>` directory for a batch job. That is one `getdents` call against a local directory: no `slurmctld` RPC, no lock, no measurable cost in an `ExecStartPre`.
+
+```console
+# ls /var/spool/slurmd
+sdg051_1474107.4294967290  sdg051_1474107.4294967292  cred_state  conf-cache
+
+# dcgm-job-map -init -print
+would keep "1474107" in /var/run/dcgm_job_maps/0
+would keep "1474107" in /var/run/dcgm_job_maps/1
+would write "0" to /var/run/dcgm_job_maps/2
+would write "0" to /var/run/dcgm_job_maps/3
+```
+
+The spool directory comes from `SlurmdSpoolDir` in `slurm.conf`, read from `$SLURM_CONF`, `/etc/slurm/slurm.conf`, or the cached copy at `/run/slurm/conf/slurm.conf` that a configless cluster gets — the same places `scontrol` looks. `%n` and `%h` in the value expand to the short hostname. Set `DCGM_SLURMD_SPOOL_DIR` to skip the lookup entirely.
+
+Two limits are worth knowing:
+
+- The check is on job **identity**, not placement. A mapping is kept if its job is still on the node — not because that job still holds that particular GPU. In practice the two agree, since the only thing that writes a job ID to a file is that job's own prolog, and the epilog clears it.
+- Jobs are visible through their **steps**. An allocation with no step running at that instant — an idle `salloc` on a cluster without `PrologFlags=Contain`, which is what creates the persistent extern step — does not appear in the spool directory and its mapping is reset. `scontrol listjobs` has the same blind spot.
+
+If the spool directory cannot be read at all, `-init` keeps every non-zero mapping and reports the failure on stderr. A stale ID lasts only until the next job lands on that device and its prolog overwrites it; an erased one is unrecoverable for the job it belonged to.
+
+### Clearing every mapping
+
+`-reset` deletes every file in the mapping directory, then recreates one per current device holding `0`:
+
+```sh
+sudo dcgm-job-map -reset
+```
+
+Unlike `-init` it never keeps a running job's ID, and the delete pass means devices that no longer exist leave no file behind. Run it after a MIG reconfiguration, or to clear mappings left stale by a prolog or epilog that did not complete. Like `-init`, it refuses to run with `SLURM_JOB_ID` set.
 
 ### Wire up the prolog and epilog
 
@@ -118,8 +156,11 @@ This does assume the GPU index dcgm-exporter reports matches the device's minor 
 ## Options
 
 ```text
--init      Create/reset mapping files for every full GPU and MIG GPU instance
-           on the node; refuses to run inside a Slurm job
+-init      Create mapping files for every full GPU and MIG GPU instance on the
+           node, resetting each to 0 unless it holds a still-running job's ID;
+           refuses to run inside a Slurm job
+-reset     Delete every mapping file, then recreate them all holding 0;
+           refuses to run inside a Slurm job
 -prolog    Write SLURM_JOB_ID to the mapping files for this job's allocated devices
 -epilog    Reset every mapping file holding SLURM_JOB_ID back to 0
 -print     Print intended writes without changing files
@@ -128,6 +169,19 @@ This does assume the GPU index dcgm-exporter reports matches the device's minor 
 ```
 
 Without `-nonzero` the process always exits `0`, so a failure here never fails the job.
+
+Environment variables:
+
+```text
+DCGM_HPC_JOB_MAPPING_DIR  Mapping file directory; default /var/run/dcgm_job_maps
+DCGM_SLURMD_SPOOL_DIR     slurmd spool dir, overriding SlurmdSpoolDir from
+                          slurm.conf; default /var/spool/slurmd  (-init)
+SLURM_CONF                slurm.conf to read SlurmdSpoolDir from  (-init)
+SLURM_JOB_ID              Job ID written by -prolog, matched by -epilog
+SLURM_JOB_GPUS            Devices allocated to the job  (-prolog)
+CUDA_VISIBLE_DEVICES      Preferred over SLURM_JOB_GPUS when it holds UUIDs,
+                          and a fallback when SLURM_JOB_GPUS is unset  (-prolog)
+```
 
 Both `-prolog` and `-epilog` need a non-empty `SLURM_JOB_ID`. Only `-prolog` reads a device list, and a job that requested no GPU simply has nothing to map. `-epilog` needs no NVML at all, so it still clears its files on a node whose driver is unhealthy.
 
