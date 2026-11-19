@@ -6,7 +6,7 @@ Four modes cover the lifecycle: `-init` creates the files at boot, `-prolog` sta
 
 ## Requirements
 
-**Build:** Linux, GCC or another compiler the Makefile accepts, and the CUDA toolkit headers for `nvml.h`.
+**Build:** GCC or Clang. The CUDA toolkit's `nvml.h` is used when present; without it the build falls back to the ABI-compatible stub in `tests/stub`, so the program and its tests build on a machine with no NVIDIA software at all.
 
 **Run:** Slurm with the `gres/gpu` plugin configured, and the NVIDIA driver on any node that should report mappings.
 
@@ -31,6 +31,14 @@ sudo make install
 make clean
 ```
 
+### Test
+
+```sh
+make test
+```
+
+No GPU, driver or Slurm is needed. The suite in `tests/run.sh` runs the real binary against `tests/fake_nvml.c`, a stand-in `libnvidia-ml.so.1` that presents whatever node the test describes — any number of GPUs, in any NVML order, with any minor numbers, PCI addresses and MIG layout — plus a fake `/proc/driver/nvidia/gpus`. Its anchor case is the node layout from the October 2026 wrongful-cancel report, where NVML order and minor-number order disagree; see [Device numbering](#device-numbering).
+
 ## Setup
 
 ### Create the mapping files
@@ -41,7 +49,9 @@ Run `-init` at boot:
 sudo dcgm-job-map -init
 ```
 
-This enumerates every GPU on the node through NVML and creates one file per device, owned by root, mode `0644`. A MIG-mode GPU gets one file per GPU instance named `<minor>.<gpu-instance-id>`; any other GPU gets a single file named `<minor>`. The mapping directory itself is created if absent, so its parent must exist and be writable.
+This enumerates every GPU on the node through NVML and creates one file per device, owned by root, mode `0644`. A MIG-mode GPU gets one file per GPU instance named `<index>.<gpu-instance-id>`; any other GPU gets a single file named `<index>`, where `<index>` is the GPU's NVML index — the number dcgm-exporter labels it with. The mapping directory itself is created if absent, so its parent must exist and be writable.
+
+On a node where `/dev/nvidia<N>` numbering does not follow NVML order, `-init` says so on stderr, one line per GPU. Nothing is wrong on such a node — see [Device numbering](#device-numbering) — but it is the kind of node where a mapping tool that assumes the two agree labels the wrong GPU, so it is worth knowing which ones you have.
 
 Every file is reset to `0`, except one that already holds the ID of a job still running on the node — see [Keeping live mappings](#keeping-live-mappings). Use [`-reset`](#clearing-every-mapping) to clear those too.
 
@@ -132,26 +142,48 @@ $ cat /var/run/dcgm_job_maps/*
 
 `Prolog` and `Epilog` run once per allocation, through `slurmd` as root, so they fire once at job start and once at job end.
 
-## Device selection
+## Device numbering
 
-Mapping files are named after each GPU's **minor number**, its `/dev/nvidia<minor>` node: `<minor>` for a full GPU and `<minor>.<gpu-instance-id>` for a MIG instance. Minor numbers are stable regardless of NVML enumeration order, so every mode agrees on the file name for a given device no matter how it was invoked.
+Two numberings meet in this tool, and on many nodes they disagree:
+
+- **dcgm-exporter** stamps mapping file `N` onto the GPU it calls `N`: the **NVML index**, which follows PCI bus order (`nvidia-smi --query-gpu=index,pci.bus_id --format=csv`).
+- **Slurm** numbers GPUs by **device file**. With `File=/dev/nvidia[0-3]` in `gres.conf`, gres index `s` is `/dev/nvidia<s>`, and `ConstrainDevices=yes` confines the job to exactly that node — so `SLURM_JOB_GPUS=3` means the job runs on the GPU whose **minor number** is 3. Minor numbers follow the driver's probe order, not PCI order.
+
+The two coincide on some nodes and not others. On one real node, NVML indices 0–3 are buses `01`, `41`, `81`, `C1`, but their minor numbers are 0, 3, 1, 2:
+
+```console
+# nvidia-smi -q | grep -E 'Minor Number|Bus Id' | paste - -
+        Bus Id : 00000000:01:00.0        Minor Number : 0
+        Bus Id : 00000000:41:00.0        Minor Number : 3
+        Bus Id : 00000000:81:00.0        Minor Number : 1
+        Bus Id : 00000000:C1:00.0        Minor Number : 2
+```
+
+A job handed `SLURM_JOB_GPUS=3` there runs on bus `41`, which dcgm-exporter calls GPU **1**. So:
+
+- Mapping files are named by **NVML index**: `<index>` for a full GPU, `<index>.<gpu-instance-id>` for a MIG instance.
+- A Slurm device number is resolved **through the minor number**: index `s` is the `s`-th device in the node's list ordered by `/dev/nvidia<N>`, which is `/dev/nvidia<s>` itself whenever minors run `0..N-1`. It is never used as an NVML position.
+
+Earlier versions did both the other way round — named files by minor number and read Slurm's index as an NVML position — which is correct only where the two orders coincide and otherwise permutes the `hpc_job` label across the jobs on the node. Anything acting on that label, such as an idle-GPU rule, then acts on the wrong job. `-init` reports every node where the orders differ, and `make test` reproduces the layout above.
+
+## Device selection
 
 The allocated devices come from `SLURM_JOB_GPUS`, falling back to `CUDA_VISIBLE_DEVICES`. `CUDA_VISIBLE_DEVICES` takes priority when it holds UUIDs, since those name an exact device. Entries are resolved as follows:
 
-- **A plain number** is a Slurm gres index: a position in the node's device list, where a MIG-mode GPU contributes one entry per GPU instance rather than one for the whole GPU. This is not an NVML enumeration ordinal. On a node whose first GPU is partitioned into four instances, gres index `0` is that GPU's first instance and index `4` is the next device, not GPU 4. Run `slurmd -G` to see Slurm's own view of the list.
+- **A plain number** is a Slurm gres index: a position in the node's device list ordered by device file, where a MIG-mode GPU contributes one entry per GPU instance rather than one for the whole GPU. This is not an NVML enumeration ordinal, for the reason above. On a node whose `/dev/nvidia0` is partitioned into four instances, gres index `0` is that GPU's first instance and index `4` is the next device, not GPU 4. Run `slurmd -G` to see Slurm's own view of the list.
 - **A range** such as `4-7` expands to each gres index it covers.
-- **A `MIG-...` UUID** resolves straight to the instance handle, giving both the GPU instance ID and the parent GPU's minor number.
+- **A `MIG-...` UUID** resolves straight to the instance handle, giving the GPU instance ID and the parent GPU.
 - **A `GPU-...` UUID** resolves to a full GPU. If that GPU is in MIG mode, the entry doesn't say which instances the job holds, so all of them are mapped.
-
-### `PrologFlags=RunInJob`
-
-The prolog handles both cases. With `RunInJob` it runs inside the job's cgroup, where NVML enumerates only the job's own devices; when that view holds exactly as many devices as the allocation names, the visible set *is* the allocation and the device numbers are never consulted. Without `RunInJob` it sees the whole node and resolves the numbers positionally. Neither can misfire on the count check itself: a confined view never shows more devices than were allocated, and unconfined, an equal count means the job holds the entire node.
-
-The epilog is unaffected either way. It never runs inside the job's cgroup, even with `RunInJob` set, so it always sees the whole node — which is exactly why it matches on job ID rather than resolving devices a second time. Resolving them would clear a different set of files than the prolog wrote and strand the job ID on the rest.
 
 Slurm's numbering is node-global, and it accounts for devices already in use. Two concurrent jobs on a partitioned node land on disjoint files: a single-GPU job takes gres index `0`, and a five-GPU job starting while it runs is handed `1,2,3,4,5`, not `0,1,2,3,4`.
 
-This does assume the GPU index dcgm-exporter reports matches the device's minor number, which holds whenever DCGM runs unrestricted, as a host-level exporter normally does. To confirm on a given node, compare `nvidia-smi --query-gpu=index,name --format=csv` against `ls -la /dev/nvidia[0-9]*`.
+### `PrologFlags=RunInJob`
+
+With `RunInJob` the prolog runs inside the job's cgroup, where NVML enumerates only the job's own devices — and renumbers them from 0, so NVML's index inside the job is not the one dcgm-exporter uses. The prolog detects this view by comparing NVML's device count against the driver's own list in `/proc/driver/nvidia/gpus`, which procfs serves regardless of the cgroup, and takes each visible GPU's node-wide index from its position in that list (sorted by PCI address, NVML's order). Because the device numbers in `SLURM_JOB_GPUS` are node-wide and a confined view cannot resolve them, the visible set is taken to be the allocation when the two have the same count — which under confinement they always do — and a numeric list that doesn't match is refused rather than guessed at.
+
+Without `RunInJob` the prolog sees the whole node and NVML's index is used directly. The driver list, when readable, is still cross-checked: a GPU whose minor number NVML and the driver disagree on, or that the driver does not list, stops the prolog with nothing written, and a node whose NVML order is not PCI order is flagged on stderr since the `RunInJob` fallback would be unreliable there. Set `DCGM_NVIDIA_PROC_GPUS_DIR` to read the list from elsewhere; if it cannot be read at all, the prolog assumes it is unconfined.
+
+The epilog is unaffected either way. It never runs inside the job's cgroup, even with `RunInJob` set, so it always sees the whole node — which is exactly why it matches on job ID rather than resolving devices a second time. Resolving them would clear a different set of files than the prolog wrote and strand the job ID on the rest.
 
 ## Options
 
@@ -181,6 +213,9 @@ SLURM_JOB_ID              Job ID written by -prolog, matched by -epilog
 SLURM_JOB_GPUS            Devices allocated to the job  (-prolog)
 CUDA_VISIBLE_DEVICES      Preferred over SLURM_JOB_GPUS when it holds UUIDs,
                           and a fallback when SLURM_JOB_GPUS is unset  (-prolog)
+DCGM_NVIDIA_PROC_GPUS_DIR Driver GPU list to read instead of
+                          /proc/driver/nvidia/gpus
+DCGM_NVML_LIBRARY         NVML library to load instead of libnvidia-ml.so.1
 ```
 
 Both `-prolog` and `-epilog` need a non-empty `SLURM_JOB_ID`. Only `-prolog` reads a device list, and a job that requested no GPU simply has nothing to map. `-epilog` needs no NVML at all, so it still clears its files on a node whose driver is unhealthy.
@@ -232,7 +267,7 @@ would write "0" to /var/run/dcgm_job_maps/3.5
 would write "0" to /var/run/dcgm_job_maps/3.6
 ```
 
-From inside the resulting allocation, where NVML shows only the three allocated instances:
+From inside the resulting allocation, where NVML shows only the three allocated instances (on this node minor numbers follow NVML order, so the file names match what `nvidia-smi -L` showed above):
 
 ```console
 $ salloc -G a100:1,a100.20gb:2
