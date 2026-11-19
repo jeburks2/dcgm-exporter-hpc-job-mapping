@@ -31,6 +31,8 @@ static nvmlReturn_t (*nvmlDeviceGetMigDeviceHandleByIndex_p)(nvmlDevice_t device
 static nvmlReturn_t (*nvmlDeviceGetGpuInstanceId_p)(nvmlDevice_t device, unsigned int *id);
 static nvmlReturn_t (*nvmlDeviceGetHandleByUUID_p)(const char *uuid, nvmlDevice_t *device);
 static nvmlReturn_t (*nvmlDeviceGetDeviceHandleFromMigDeviceHandle_p)(nvmlDevice_t mig, nvmlDevice_t *device);
+static nvmlReturn_t (*nvmlDeviceGetPciInfo_v3_p)(nvmlDevice_t device, nvmlPciInfo_t *pci);
+static nvmlReturn_t (*nvmlDeviceGetIndex_p)(nvmlDevice_t device, unsigned int *index);
 
 /* Resolve one NVML symbol into *ptr, bailing out of load_nvml() if it's missing. */
 #define LOAD_SYM(ptr, name)                                                                \
@@ -67,6 +69,8 @@ static int load_nvml(void)
     LOAD_SYM(nvmlDeviceGetGpuInstanceId_p, "nvmlDeviceGetGpuInstanceId");
     LOAD_SYM(nvmlDeviceGetHandleByUUID_p, "nvmlDeviceGetHandleByUUID");
     LOAD_SYM(nvmlDeviceGetDeviceHandleFromMigDeviceHandle_p, "nvmlDeviceGetDeviceHandleFromMigDeviceHandle");
+    LOAD_SYM(nvmlDeviceGetPciInfo_v3_p, "nvmlDeviceGetPciInfo_v3");
+    LOAD_SYM(nvmlDeviceGetIndex_p, "nvmlDeviceGetIndex");
 
     return 0;
 }
@@ -108,8 +112,10 @@ static void usage(const char *prog)
         "Device selection:\n"
         "  -prolog reads the job's allocated devices from SLURM_JOB_GPUS or\n"
         "  CUDA_VISIBLE_DEVICES. Each entry is a GPU/MIG instance UUID, or a Slurm gres\n"
-        "  index -- a position in the node's device list, where a MIG-mode GPU\n"
-        "  contributes one entry per GPU instance rather than one for the whole GPU.\n"
+        "  index -- a position in the node's device list ordered by minor number\n"
+        "  (/dev/nvidia<N>), where a MIG-mode GPU contributes one entry per GPU\n"
+        "  instance. Mapping files are named by NVML index, which is what\n"
+        "  dcgm-exporter labels GPUs with; the two orders differ on many nodes.\n"
         "  -epilog selects no devices: it clears whichever files hold SLURM_JOB_ID.\n"
         "\n"
         "Running jobs:\n"
@@ -128,6 +134,8 @@ static void usage(const char *prog)
         "  SLURM_JOB_GPUS            Devices allocated to the job (-prolog)\n"
         "  CUDA_VISIBLE_DEVICES      Preferred over SLURM_JOB_GPUS when it holds UUIDs,\n"
         "                            and used as a fallback when SLURM_JOB_GPUS is unset\n"
+        "  DCGM_NVIDIA_PROC_GPUS_DIR Driver GPU list to read instead of\n"
+        "                            /proc/driver/nvidia/gpus\n"
         "\n"
         "Default mapping dir: %s\n"
         "Default slurmd spool dir: %s\n",
@@ -230,15 +238,26 @@ static int mig_enabled(nvmlDevice_t gpu)
 
 /*
  * One allocatable device: a full GPU, or one MIG GPU instance of one. The table holds these in NVML
- * enumeration order -- GPUs by NVML index, a MIG GPU's instances by MIG index -- which is the order
- * Slurm's gres/gpu NVML autodetect builds the node's GPU gres list in, and so the order its device
- * numbering follows. Devices are identified by the parent GPU's minor number rather than its NVML
- * position, so every mode names the same file for the same physical device.
+ * enumeration order -- GPUs by NVML index, a MIG GPU's instances by MIG index.
+ *
+ * Two different numberings meet here, and they do not agree on every node:
+ *
+ *   - dcgm-exporter stamps mapping file N onto the GPU it calls N, which is the NVML index: NVML
+ *     enumerates GPUs in PCI bus order. Mapping files are therefore named by host NVML index.
+ *   - Slurm's gres index -- what SLURM_JOB_GPUS and ConstrainDevices use -- follows the device file,
+ *     /dev/nvidia<minor>, and minor numbers follow the driver's probe order. Slurm device numbers are
+ *     therefore resolved through the minor number, never used as a table position.
+ *
+ * Earlier versions named files by minor number and looked device numbers up as NVML positions,
+ * which is correct only on nodes where the two orders coincide and permutes the labels across jobs
+ * everywhere else. -init reports such nodes; see report_device_order().
  */
 struct node_device
 {
-    unsigned int minor; /* parent GPU's minor number, i.e. /dev/nvidia<minor> */
-    unsigned int gi;    /* GPU instance ID, meaningful only when is_mig */
+    unsigned int nvml_index; /* parent GPU's index in this process's NVML enumeration */
+    unsigned int host_index; /* parent GPU's index on the unconfined node: the dcgm-exporter gpu label */
+    unsigned int minor;      /* parent GPU's minor number, i.e. /dev/nvidia<minor> */
+    unsigned int gi;         /* GPU instance ID, meaningful only when is_mig */
     int is_mig;
 };
 
@@ -246,27 +265,146 @@ static struct node_device node_devices[MAX_ITEMS];
 static unsigned int node_device_count = 0;
 static int node_table_built = 0;
 
-/* "<minor>.<gi>" for a MIG instance, "<minor>" for a full GPU. */
+/*
+ * node_devices[] indices in Slurm's gres order: by minor number, a MIG GPU's instances in MIG index
+ * order after their parent. Slurm device number s is slurm_order[s].
+ */
+static unsigned int slurm_order[MAX_ITEMS];
+
+/* Set when NVML is showing less than the whole node, i.e. the process is inside a device cgroup. */
+static int nvml_confined = 0;
+
+/*
+ * The driver's own list of every GPU on the node, from /proc/driver/nvidia/gpus. procfs is not subject
+ * to the device cgroup, so this is complete even when NVML's view is confined to a job's allocation
+ * (PrologFlags=RunInJob). Sorted by PCI address, which is NVML's enumeration order, so a GPU's position
+ * here is its host NVML index -- the one dcgm-exporter uses -- whatever index NVML gives it locally.
+ */
+struct proc_gpu
+{
+    unsigned int domain;
+    unsigned int bus;
+    unsigned int device;
+    unsigned int function;
+    unsigned int minor;
+};
+
+static struct proc_gpu proc_gpus[MAX_ITEMS];
+static int proc_gpu_count = -1; /* -1: list unavailable (no driver, or not Linux) */
+
+#define DEFAULT_NVIDIA_PROC_GPUS_DIR "/proc/driver/nvidia/gpus"
+
+static int parse_pci_addr(const char *str, unsigned int *domain, unsigned int *bus, unsigned int *device,
+                          unsigned int *function)
+{
+    return sscanf(str, "%x:%x:%x.%x", domain, bus, device, function) == 4;
+}
+
+static int proc_gpu_cmp(const void *a, const void *b)
+{
+    const struct proc_gpu *x = a;
+    const struct proc_gpu *y = b;
+
+    if (x->domain != y->domain)
+        return x->domain < y->domain ? -1 : 1;
+    if (x->bus != y->bus)
+        return x->bus < y->bus ? -1 : 1;
+    if (x->device != y->device)
+        return x->device < y->device ? -1 : 1;
+    if (x->function != y->function)
+        return x->function < y->function ? -1 : 1;
+    return 0;
+}
+
+/* "Device Minor:" from one GPU's information file. */
+static int proc_gpu_minor(const char *dir, const char *name, unsigned int *minor)
+{
+    char path[512];
+    char line[256];
+    FILE *f;
+    int found = 0;
+
+    snprintf(path, sizeof(path), "%s/%s/information", dir, name);
+    f = fopen(path, "r");
+    if (!f)
+        return -1;
+
+    while (!found && fgets(line, sizeof(line), f))
+    {
+        if (strncmp(line, "Device Minor:", 13) == 0 && sscanf(line + 13, " %u", minor) == 1)
+            found = 1;
+    }
+
+    fclose(f);
+    return found ? 0 : -1;
+}
+
+static void load_proc_gpus(void)
+{
+    const char *env = getenv("DCGM_NVIDIA_PROC_GPUS_DIR");
+    const char *dir = (env && *env) ? env : DEFAULT_NVIDIA_PROC_GPUS_DIR;
+    DIR *d = opendir(dir);
+    struct dirent *ent;
+
+    proc_gpu_count = -1;
+    if (!d)
+        return;
+
+    proc_gpu_count = 0;
+    while ((ent = readdir(d)) != NULL && proc_gpu_count < MAX_ITEMS)
+    {
+        struct proc_gpu *g = &proc_gpus[proc_gpu_count];
+
+        if (!parse_pci_addr(ent->d_name, &g->domain, &g->bus, &g->device, &g->function))
+            continue;
+
+        if (proc_gpu_minor(dir, ent->d_name, &g->minor) != 0)
+            continue;
+
+        proc_gpu_count++;
+    }
+
+    closedir(d);
+    qsort(proc_gpus, (size_t)proc_gpu_count, sizeof(proc_gpus[0]), proc_gpu_cmp);
+}
+
+/* The driver-list position of the GPU at this PCI address, or -1 if the driver doesn't list it. */
+static int proc_gpu_rank(unsigned int domain, unsigned int bus, unsigned int device, unsigned int function)
+{
+    for (int i = 0; i < proc_gpu_count; i++)
+    {
+        if (proc_gpus[i].domain == domain && proc_gpus[i].bus == bus && proc_gpus[i].device == device &&
+            proc_gpus[i].function == function)
+            return i;
+    }
+
+    return -1;
+}
+
+/* "<host-index>.<gi>" for a MIG instance, "<host-index>" for a full GPU. */
 static void device_map_id(const struct node_device *dev, char *buf, size_t len)
 {
     if (dev->is_mig)
-        snprintf(buf, len, "%u.%u", dev->minor, dev->gi);
+        snprintf(buf, len, "%u.%u", dev->host_index, dev->gi);
     else
-        snprintf(buf, len, "%u", dev->minor);
+        snprintf(buf, len, "%u", dev->host_index);
 }
 
-static void add_node_device(unsigned int minor, int is_mig, unsigned int gi)
+static void add_node_device(unsigned int nvml_index, unsigned int host_index, unsigned int minor, int is_mig,
+                            unsigned int gi)
 {
     if (node_device_count >= MAX_ITEMS)
         return;
 
+    node_devices[node_device_count].nvml_index = nvml_index;
+    node_devices[node_device_count].host_index = host_index;
     node_devices[node_device_count].minor = minor;
     node_devices[node_device_count].is_mig = is_mig;
     node_devices[node_device_count].gi = gi;
     node_device_count++;
 }
 
-static void add_gpu_migs(nvmlDevice_t gpu, unsigned int minor)
+static void add_gpu_migs(nvmlDevice_t gpu, unsigned int nvml_index, unsigned int host_index, unsigned int minor)
 {
     unsigned int max_migs = 0;
 
@@ -285,7 +423,78 @@ static void add_gpu_migs(nvmlDevice_t gpu, unsigned int minor)
         if (nvmlDeviceGetGpuInstanceId_p(mig, &gi) != NVML_SUCCESS)
             continue;
 
-        add_node_device(minor, 1, gi);
+        add_node_device(nvml_index, host_index, minor, 1, gi);
+    }
+}
+
+/*
+ * The index dcgm-exporter will use for this GPU. Unconfined, NVML's own index is authoritative. Confined,
+ * the local index counts only the job's devices, so the GPU's position in the driver's node-wide list
+ * stands in for it. Returns -1 when that cannot be established.
+ */
+static int host_gpu_index(nvmlDevice_t gpu, unsigned int nvml_index, unsigned int minor)
+{
+    nvmlPciInfo_t pci;
+    unsigned int domain, bus, device, function;
+    int rank;
+
+    if (proc_gpu_count < 0)
+    {
+        if (nvml_confined)
+            return -1;
+        return (int)nvml_index;
+    }
+
+    memset(&pci, 0, sizeof(pci));
+    if (nvmlDeviceGetPciInfo_v3_p(gpu, &pci) != NVML_SUCCESS ||
+        !parse_pci_addr(pci.busId, &domain, &bus, &device, &function))
+    {
+        fprintf(stderr, "dcgm-job-map: cannot read the PCI address of NVML device %u\n", nvml_index);
+        return -1;
+    }
+
+    rank = proc_gpu_rank(domain, bus, device, function);
+    if (rank < 0)
+    {
+        fprintf(stderr, "dcgm-job-map: NVML device %u (%s) is not in the driver's GPU list\n", nvml_index,
+                pci.busId);
+        return -1;
+    }
+
+    if (proc_gpus[rank].minor != minor)
+    {
+        fprintf(stderr,
+                "dcgm-job-map: NVML says device %u (%s) is /dev/nvidia%u but the driver says /dev/nvidia%u\n",
+                nvml_index, pci.busId, minor, proc_gpus[rank].minor);
+        return -1;
+    }
+
+    if (nvml_confined)
+        return rank;
+
+    if ((unsigned int)rank != nvml_index)
+        fprintf(stderr,
+                "dcgm-job-map: warning: NVML index %u (%s) is not in PCI bus order (driver list position %d); "
+                "a PrologFlags=RunInJob prolog cannot map this node reliably\n",
+                nvml_index, pci.busId, rank);
+
+    return (int)nvml_index;
+}
+
+/* Stable insertion sort of the table indices by minor number: Slurm's gres order. */
+static void build_slurm_order(void)
+{
+    for (unsigned int i = 0; i < node_device_count; i++)
+    {
+        unsigned int j = i;
+
+        while (j > 0 && node_devices[slurm_order[j - 1]].minor > node_devices[i].minor)
+        {
+            slurm_order[j] = slurm_order[j - 1];
+            j--;
+        }
+
+        slurm_order[j] = i;
     }
 }
 
@@ -300,10 +509,14 @@ static int build_node_device_table(void)
     if (nvmlDeviceGetCount_v2_p(&gpu_count) != NVML_SUCCESS)
         return -1;
 
+    load_proc_gpus();
+    nvml_confined = proc_gpu_count > (int)gpu_count;
+
     for (unsigned int gpu_index = 0; gpu_index < gpu_count; gpu_index++)
     {
         nvmlDevice_t gpu;
         unsigned int minor = 0;
+        int host_index;
 
         if (nvmlDeviceGetHandleByIndex_v2_p(gpu_index, &gpu) != NVML_SUCCESS)
             continue;
@@ -311,14 +524,55 @@ static int build_node_device_table(void)
         if (nvmlDeviceGetMinorNumber_p(gpu, &minor) != NVML_SUCCESS)
             continue;
 
+        host_index = host_gpu_index(gpu, gpu_index, minor);
+        if (host_index < 0)
+        {
+            fprintf(stderr,
+                    "dcgm-job-map: cannot determine the node-wide index of NVML device %u (/dev/nvidia%u); "
+                    "writing no mapping rather than a wrong one\n",
+                    gpu_index, minor);
+            return -1;
+        }
+
         if (mig_enabled(gpu))
-            add_gpu_migs(gpu, minor);
+            add_gpu_migs(gpu, gpu_index, (unsigned int)host_index, minor);
         else
-            add_node_device(minor, 0, 0);
+            add_node_device(gpu_index, (unsigned int)host_index, minor, 0, 0);
     }
 
+    build_slurm_order();
     node_table_built = 1;
     return 0;
+}
+
+/*
+ * Say so when minor numbers do not follow NVML order on this node. Nothing is wrong -- the two are
+ * translated correctly either way -- but this is the node where a tool that assumes they agree, as this
+ * one once did, silently labels the wrong GPU. Called by -init and -reset.
+ */
+static void report_device_order(void)
+{
+    unsigned int mismatches = 0;
+
+    for (unsigned int i = 0; i < node_device_count; i++)
+    {
+        const struct node_device *dev = &node_devices[i];
+
+        if (dev->is_mig && i > 0 && node_devices[i - 1].nvml_index == dev->nvml_index)
+            continue; /* one line per GPU, not per instance */
+
+        if (dev->minor == dev->host_index)
+            continue;
+
+        fprintf(stderr, "dcgm-job-map: GPU %u (NVML/dcgm-exporter index) is /dev/nvidia%u (Slurm index %u)\n",
+                dev->host_index, dev->minor, dev->minor);
+        mismatches++;
+    }
+
+    if (mismatches)
+        fprintf(stderr,
+                "dcgm-job-map: minor numbers do not follow NVML order on this node: Slurm device numbers "
+                "are translated through /dev/nvidia<N>, not used as GPU indices\n");
 }
 
 static void add_all_node_devices(char maps[][32], unsigned int *count)
@@ -333,18 +587,42 @@ static void add_all_node_devices(char maps[][32], unsigned int *count)
 }
 
 /* Add every MIG instance of one GPU, for an entry naming the GPU but not an instance. */
-static void add_gpu_mig_maps(unsigned int minor, char maps[][32], unsigned int *count)
+static void add_gpu_mig_maps(unsigned int nvml_index, char maps[][32], unsigned int *count)
 {
     for (unsigned int i = 0; i < node_device_count; i++)
     {
         char map_id[32];
 
-        if (!node_devices[i].is_mig || node_devices[i].minor != minor)
+        if (!node_devices[i].is_mig || node_devices[i].nvml_index != nvml_index)
             continue;
 
         device_map_id(&node_devices[i], map_id, sizeof(map_id));
         add_map(maps, count, map_id);
     }
+}
+
+/* The table entry for a full-GPU handle, or NULL if the GPU is MIG-partitioned or unknown. */
+static const struct node_device *find_gpu_device(unsigned int nvml_index)
+{
+    for (unsigned int i = 0; i < node_device_count; i++)
+    {
+        if (!node_devices[i].is_mig && node_devices[i].nvml_index == nvml_index)
+            return &node_devices[i];
+    }
+
+    return NULL;
+}
+
+/* The table entry for one MIG instance of a GPU, or NULL. */
+static const struct node_device *find_mig_device(unsigned int nvml_index, unsigned int gi)
+{
+    for (unsigned int i = 0; i < node_device_count; i++)
+    {
+        if (node_devices[i].is_mig && node_devices[i].nvml_index == nvml_index && node_devices[i].gi == gi)
+            return &node_devices[i];
+    }
+
+    return NULL;
 }
 
 /* Every device on the node, for -init. -prolog uses collect_job_maps() instead. */
@@ -463,25 +741,32 @@ static const char *get_device_env(void)
 }
 
 /*
- * A device number is a position in the node device table, which is how Slurm numbers the GPU gres it
- * can allocate: on a MIG-mode GPU each instance is separately allocatable and consumes its own number,
- * so number 0 on a node whose first GPU is partitioned is that GPU's first instance, not the whole GPU.
+ * A Slurm device number is a position in the node's device list in Slurm's order: by device file, so by
+ * minor number, with a MIG-mode GPU contributing one entry per GPU instance. On a node whose minors run
+ * 0..N-1 with no MIG, number s is simply /dev/nvidia<s> -- which is not, in general, NVML device s.
  */
 static void resolve_device_number(unsigned int index, char maps[][32], unsigned int *count)
 {
     char map_id[32];
 
+    if (nvml_confined)
+    {
+        fprintf(stderr,
+                "dcgm-job-map: device number %u cannot be resolved from inside the job's cgroup, where NVML "
+                "shows only the job's own devices; Slurm numbers devices across the whole node\n",
+                index);
+        return;
+    }
+
     if (index >= node_device_count)
     {
         fprintf(stderr,
-                "dcgm-job-map: device %u is past the end of the node's device list (%u devices); "
-                "Slurm numbers devices across the whole node, so this usually means NVML is only "
-                "showing part of it -- run from the job Prolog/Epilog, not from inside the job\n",
+                "dcgm-job-map: device %u is past the end of the node's device list (%u devices)\n",
                 index, node_device_count);
         return;
     }
 
-    device_map_id(&node_devices[index], map_id, sizeof(map_id));
+    device_map_id(&node_devices[slurm_order[index]], map_id, sizeof(map_id));
     add_map(maps, count, map_id);
 }
 
@@ -489,15 +774,19 @@ static void resolve_device_number(unsigned int index, char maps[][32], unsigned 
  * Resolve one list entry -- a device number, a range of them, or a UUID -- into the mapping ID(s) it
  * names. nvmlDeviceGetHandleByUUID takes both a full GPU's UUID and a MIG instance's; afterwards,
  * nvmlDeviceGetGpuInstanceId succeeding is what distinguishes the two, since only a MIG device has an
- * instance ID at all.
+ * instance ID at all. Either way the handle is matched back to its table entry, which carries the
+ * host index the file is named by.
  */
 static void resolve_device_entry(const char *entry, char maps[][32], unsigned int *count)
 {
     nvmlDevice_t dev;
+    nvmlDevice_t parent;
     unsigned long lo = 0;
     unsigned long hi = 0;
-    unsigned int minor = 0;
+    unsigned int nvml_index = 0;
     unsigned int gi = 0;
+    const struct node_device *found;
+    char map_id[32];
 
     if (!*entry)
         return;
@@ -517,40 +806,43 @@ static void resolve_device_entry(const char *entry, char maps[][32], unsigned in
     }
 
     if (nvmlDeviceGetHandleByUUID_p(entry, &dev) != NVML_SUCCESS)
+    {
+        fprintf(stderr, "dcgm-job-map: NVML does not know device %s\n", entry);
         return;
+    }
 
     if (nvmlDeviceGetGpuInstanceId_p(dev, &gi) == NVML_SUCCESS)
     {
-        /* A MIG instance handle: its parent GPU's minor number completes the "<minor>.<gi>" name. */
-        nvmlDevice_t parent;
-        char map_id[32];
-
-        if (nvmlDeviceGetDeviceHandleFromMigDeviceHandle_p(dev, &parent) != NVML_SUCCESS)
+        /* A MIG instance handle: its parent GPU's table entry carries the host index. */
+        if (nvmlDeviceGetDeviceHandleFromMigDeviceHandle_p(dev, &parent) != NVML_SUCCESS ||
+            nvmlDeviceGetIndex_p(parent, &nvml_index) != NVML_SUCCESS)
             return;
 
-        if (nvmlDeviceGetMinorNumber_p(parent, &minor) != NVML_SUCCESS)
+        found = find_mig_device(nvml_index, gi);
+        if (!found)
             return;
 
-        snprintf(map_id, sizeof(map_id), "%u.%u", minor, gi);
+        device_map_id(found, map_id, sizeof(map_id));
         add_map(maps, count, map_id);
         return;
     }
 
-    if (nvmlDeviceGetMinorNumber_p(dev, &minor) != NVML_SUCCESS)
+    if (nvmlDeviceGetIndex_p(dev, &nvml_index) != NVML_SUCCESS)
         return;
 
     if (mig_enabled(dev))
     {
         /* A full-GPU UUID for a MIG GPU doesn't say which instances the job owns: map them all. */
-        add_gpu_mig_maps(minor, maps, count);
+        add_gpu_mig_maps(nvml_index, maps, count);
+        return;
     }
-    else
-    {
-        char map_id[32];
 
-        snprintf(map_id, sizeof(map_id), "%u", minor);
-        add_map(maps, count, map_id);
-    }
+    found = find_gpu_device(nvml_index);
+    if (!found)
+        return;
+
+    device_map_id(found, map_id, sizeof(map_id));
+    add_map(maps, count, map_id);
 }
 
 /* This job's mapping IDs, from Slurm's allocated-device env var (-prolog). */
@@ -572,11 +864,11 @@ static int collect_job_maps(char maps[][32], unsigned int *count)
     /*
      * Under PrologFlags=RunInJob the prolog runs inside the job's cgroup, where NVML enumerates only
      * the job's own devices. That view is exact, so when it holds as many devices as the allocation
-     * names, map all of them and skip the numbering entirely. This is the reliable path: Slurm's
-     * device numbers are not always positions in the node's device list -- a job allocated GPU
-     * instances 3 and 5 of a mixed-profile MIG GPU is handed "0,1" -- so the fallback below can pick
-     * the wrong instance. The check cannot misfire: a confined view never shows more devices than
-     * were allocated, and unconfined an equal count means the job holds the whole node.
+     * names, map all of them and skip the numbering entirely -- the device numbers are node-wide and
+     * cannot be resolved against a partial list anyway. Unconfined, an equal count means the job holds
+     * the whole node and the result is the same either way. The names still come out right under
+     * confinement because each device's host index is taken from the driver's node-wide list, not from
+     * NVML's local renumbering.
      */
     if (!is_uuid_list(env) && count_device_entries(env) == node_device_count)
     {
@@ -877,6 +1169,8 @@ static int run_init(const char *dir)
     if (collect_maps(maps, &count) != 0)
         return -1;
 
+    report_device_order();
+
     if (!print_only && mkdir(dir, 0755) != 0 && errno != EEXIST)
         return -1;
 
@@ -962,6 +1256,8 @@ static int run_reset(const char *dir)
 
     if (collect_maps(maps, &count) != 0)
         return -1;
+
+    report_device_order();
 
     if (!print_only && mkdir(dir, 0755) != 0 && errno != EEXIST)
         return -1;
@@ -1088,5 +1384,5 @@ int main(int argc, char **argv)
     dlclose(nvml_lib);
 
     /* Without -nonzero, always exit 0 so this program never fails a Slurm prolog/epilog. */
-    return nonzero ? rc : 0;
+    return nonzero ? (rc != 0) : 0;
 }
