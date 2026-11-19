@@ -48,13 +48,18 @@ static nvmlReturn_t (*nvmlDeviceGetIndex_p)(nvmlDevice_t device, unsigned int *i
         }                                                                                  \
     } while (0)
 
+#define DEFAULT_NVML_LIBRARY "libnvidia-ml.so.1"
+
 /*
  * Returns -1 silently when the library is missing -- the normal case on a GPU-less node -- but reports
- * a missing symbol, which points to a driver/header version mismatch instead.
+ * a missing symbol, which points to a driver/header version mismatch instead. DCGM_NVML_LIBRARY names
+ * another library to load, which is how the test suite substitutes its fake NVML for the driver's.
  */
 static int load_nvml(void)
 {
-    nvml_lib = dlopen("libnvidia-ml.so.1", RTLD_LAZY);
+    const char *env = getenv("DCGM_NVML_LIBRARY");
+
+    nvml_lib = dlopen((env && *env) ? env : DEFAULT_NVML_LIBRARY, RTLD_LAZY);
     if (!nvml_lib)
         return -1;
 
@@ -136,6 +141,7 @@ static void usage(const char *prog)
         "                            and used as a fallback when SLURM_JOB_GPUS is unset\n"
         "  DCGM_NVIDIA_PROC_GPUS_DIR Driver GPU list to read instead of\n"
         "                            /proc/driver/nvidia/gpus\n"
+        "  DCGM_NVML_LIBRARY         NVML library to load instead of libnvidia-ml.so.1\n"
         "\n"
         "Default mapping dir: %s\n"
         "Default slurmd spool dir: %s\n",

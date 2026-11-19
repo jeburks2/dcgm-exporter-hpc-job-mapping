@@ -215,6 +215,7 @@ CUDA_VISIBLE_DEVICES      Preferred over SLURM_JOB_GPUS when it holds UUIDs,
                           and a fallback when SLURM_JOB_GPUS is unset  (-prolog)
 DCGM_NVIDIA_PROC_GPUS_DIR Driver GPU list to read instead of
                           /proc/driver/nvidia/gpus
+DCGM_NVML_LIBRARY         NVML library to load instead of libnvidia-ml.so.1
 ```
 
 Both `-prolog` and `-epilog` need a non-empty `SLURM_JOB_ID`. Only `-prolog` reads a device list, and a job that requested no GPU simply has nothing to map. `-epilog` needs no NVML at all, so it still clears its files on a node whose driver is unhealthy.

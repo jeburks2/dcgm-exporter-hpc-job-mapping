@@ -2,7 +2,9 @@
 #
 # dcgm-job-map test suite. Runs the real binary against tests/build/libnvidia-ml.so.1, a fake NVML
 # whose node layout is set per test through FAKE_NVML_GPUS (see tests/fake_nvml.c), and a fake
-# /proc/driver/nvidia/gpus built per test under a temp dir. No GPU, driver or Slurm is needed.
+# /proc/driver/nvidia/gpus built per test under a temp dir. No GPU, driver or Slurm is needed, and
+# a real driver on the test host is never touched: the binary is told which library to load through
+# DCGM_NVML_LIBRARY, so a node's own libnvidia-ml.so.1 is never found by accident.
 #
 # Usage: make test        (or: bash tests/run.sh, after make and the fake library are built)
 #
@@ -14,10 +16,9 @@ set -u
 
 cd "$(dirname "$0")/.."
 BIN="$PWD/dcgm-job-map"
-FAKE_LIBDIR="$PWD/tests/build"
-LIBDIR="$FAKE_LIBDIR"
+FAKE_NVML="$PWD/tests/build/libnvidia-ml.so.1"
 
-if [ ! -x "$BIN" ] || [ ! -f "$LIBDIR/libnvidia-ml.so.1" ]; then
+if [ ! -x "$BIN" ] || [ ! -f "$FAKE_NVML" ]; then
     echo "build first: make dcgm-job-map tests/build/libnvidia-ml.so.1" >&2
     exit 2
 fi
@@ -44,8 +45,7 @@ begin() {
     export DCGM_HPC_JOB_MAPPING_DIR="$MAPS"
     export DCGM_SLURMD_SPOOL_DIR="$SPOOL"
     export DCGM_NVIDIA_PROC_GPUS_DIR="$PROC"
-    LIBDIR="$FAKE_LIBDIR"
-    export LD_LIBRARY_PATH="$LIBDIR"
+    export DCGM_NVML_LIBRARY="$FAKE_NVML"
 }
 
 ok() {
@@ -78,20 +78,15 @@ proc_gpus() {
     done
 }
 
-# Run the binary with the given arguments, capturing exit status and output. It runs from the fake
-# library's directory: Linux finds libnvidia-ml.so.1 through LD_LIBRARY_PATH, macOS dyld ignores that
-# variable but does try a bare library name against the working directory. The binary itself never
-# depends on its working directory, every path it uses being absolute.
+# Run the binary with the given arguments, capturing exit status and output.
 run() {
-    (cd "$LIBDIR" && exec "$BIN" "$@") > "$CASE/stdout" 2> "$CASE/stderr"
+    "$BIN" "$@" > "$CASE/stdout" 2> "$CASE/stderr"
     RC=$?
 }
 
-# Make the fake library unfindable, as on a node with no NVIDIA driver.
+# Point the binary at a library that doesn't exist, as on a node with no NVIDIA driver.
 no_driver() {
-    mkdir -p "$CASE/nowhere"
-    LIBDIR="$CASE/nowhere"
-    export LD_LIBRARY_PATH="$LIBDIR"
+    export DCGM_NVML_LIBRARY="$CASE/nowhere/libnvidia-ml.so.1"
 }
 
 running_job() {
